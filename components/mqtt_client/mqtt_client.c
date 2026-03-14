@@ -256,6 +256,95 @@ static void send_discovery_button(esp_mqtt_client_handle_t client, const char *o
 }
 
 /**
+ * @brief Отправка конфигурации сенсора версии прошивки для Home Assistant Discovery
+ * 
+ * @param client Дескриптор MQTT клиента
+ */
+static void send_discovery_firmware_version(esp_mqtt_client_handle_t client)
+{
+    char topic[128];
+    char payload[1024];
+
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/hydroesp32/firmware_version/config");
+    
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"Firmware Version\","
+             "\"state_topic\":\"hydro/firmware/version\","
+             "\"unique_id\":\"esp32_hydro_firmware_version\","
+             "\"icon\":\"mdi:chip\","
+             "\"entity_category\":\"diagnostic\","
+             "\"device\":{"
+             "\"identifiers\":[\"esp32_hydro_controller\"],"
+             "\"name\":\"Hydro Controller\","
+             "\"model\":\"ESP32\","
+             "\"manufacturer\":\"HydroNFT\""
+             "}}");
+
+    esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "Firmware version discovery sent");
+}
+
+/**
+ * @brief Отправка конфигурации сенсора прогресса OTA для Home Assistant Discovery
+ * 
+ * @param client Дескриптор MQTT клиента
+ */
+static void send_discovery_ota_progress(esp_mqtt_client_handle_t client)
+{
+    char topic[128];
+    char payload[1024];
+
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/hydroesp32/ota_progress/config");
+    
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"OTA Progress\","
+             "\"state_topic\":\"hydro/ota/progress\","
+             "\"unique_id\":\"esp32_hydro_ota_progress\","
+             "\"unit_of_measurement\":\"%%\","
+             "\"icon\":\"mdi:progress-download\","
+             "\"value_template\":\"{{ value_json.progress }}\","
+             "\"entity_category\":\"diagnostic\","
+             "\"device\":{"
+             "\"identifiers\":[\"esp32_hydro_controller\"],"
+             "\"name\":\"Hydro Controller\","
+             "\"model\":\"ESP32\","
+             "\"manufacturer\":\"HydroNFT\""
+             "}}");
+
+    esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "OTA progress discovery sent");
+}
+
+/**
+ * @brief Отправка конфигурации сенсора статуса OTA для Home Assistant Discovery
+ * 
+ * @param client Дескриптор MQTT клиента
+ */
+static void send_discovery_ota_status(esp_mqtt_client_handle_t client)
+{
+    char topic[128];
+    char payload[1024];
+
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/hydroesp32/ota_status/config");
+    
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"OTA Status\","
+             "\"state_topic\":\"hydro/ota/status\","
+             "\"unique_id\":\"esp32_hydro_ota_status\","
+             "\"icon\":\"mdi:state-machine\","
+             "\"entity_category\":\"diagnostic\","
+             "\"device\":{"
+             "\"identifiers\":[\"esp32_hydro_controller\"],"
+             "\"name\":\"Hydro Controller\","
+             "\"model\":\"ESP32\","
+             "\"manufacturer\":\"HydroNFT\""
+             "}}");
+
+    esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "OTA status discovery sent");
+}
+
+/**
  * @brief Публикация состояния выключателя
  * 
  * Отправляет текущее состояние выключателя (ON/OFF) в MQTT топик.
@@ -322,6 +411,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             send_discovery_sensor(mqtt_client, "temperature", "Temperature", "°C", "temperature", "hydro/sensor/temperature/state");
             // Влажность (DHT) - используем device_class "humidity"
             send_discovery_sensor(mqtt_client, "humidity", "Humidity", "%", "humidity", "hydro/sensor/humidity/state");
+            
+            // Сенсоры OTA
+            // Версия прошивки
+            send_discovery_firmware_version(mqtt_client);
+            // Прогресс OTA
+            send_discovery_ota_progress(mqtt_client);
+            // Статус OTA
+            send_discovery_ota_status(mqtt_client);
 
             // Выключатели
             send_discovery_switch(mqtt_client, "pump", "Circulation Pump",
@@ -462,7 +559,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
  * Вызывается один раз в app_main().
  * 
  * Конфигурация подключения:
- * - Broker URI: mqtt://192.168.0.105:1883
+ * - Broker URI: mqtt://192.168.0.107:1883
  * - Username: hydroesp32
  * - Password: asda
  * 
@@ -597,6 +694,53 @@ void mqtt_client_publish_sensor_data(void)
 // Эта функция больше не используется - время синхронизируется через SNTP,
 // но не публикуется в MQTT.
 //
+
+// ============================================================================
+// ПУБЛИКАЦИЯ ПРОГРЕССА OTA
+// ============================================================================
+
+/**
+ * @brief Публикация прогресса OTA обновления в MQTT
+ * 
+ * Отправляет текущий прогресс загрузки прошивки в топик hydro/ota/progress
+ * в формате JSON.
+ * 
+ * @param progress Прогресс в процентах (0-100)
+ * @param downloaded Количество загруженных байт
+ * @param total Общий размер файла в байтах
+ * 
+ * @note Топик: hydro/ota/progress
+ * @note Формат: {"progress":50,"downloaded":493752,"total":987504}
+ */
+void mqtt_client_publish_ota_progress(int progress, int downloaded, int total)
+{
+    if (mqtt_connected && mqtt_client) {
+        char json_msg[128];
+        snprintf(json_msg, sizeof(json_msg),
+                "{\"progress\":%d,\"downloaded\":%d,\"total\":%d}",
+                progress, downloaded, total);
+        
+        esp_mqtt_client_publish(mqtt_client, "hydro/ota/progress", json_msg, 0, 1, 0);
+    }
+}
+
+/**
+ * @brief Публикация версии прошивки в MQTT
+ * 
+ * Отправляет текущую версию прошивки в топик hydro/firmware/version
+ * 
+ * @param version Строка версии прошивки
+ * 
+ * @note Топик: hydro/firmware/version
+ * @note Пример: "0.2"
+ */
+void mqtt_client_publish_firmware_version(const char *version)
+{
+    if (mqtt_connected && mqtt_client && version) {
+        esp_mqtt_client_publish(mqtt_client, "hydro/firmware/version", version, 0, 1, 1);
+        ESP_LOGI(TAG, "Published firmware version: %s", version);
+    }
+}
 // /**
 //  * @brief Публикация текущего времени в MQTT
 //  *

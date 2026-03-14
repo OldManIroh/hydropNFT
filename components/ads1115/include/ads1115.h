@@ -53,6 +53,24 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements);
  */
 void ads1115_measure_all_channels_legacy(void);
 
+/**
+ * @brief Деинициализация I2C драйвера
+ * 
+ * Вызывается перед OTA обновлением для освобождения I2C шины.
+ * 
+ * @note Вызывать только перед OTA обновлением (когда версии НЕ совпали)
+ * @note НЕ вызывать если OTA не требуется (версии совпали)
+ */
+void ads1115_deinit(void);
+
+/**
+ * @brief Сброс состояния ADS1115
+ * 
+ * Полностью сбрасывает состояние компонента.
+ * Используется при ошибках инициализации.
+ */
+void ads1115_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

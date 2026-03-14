@@ -62,6 +62,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <freertos/task.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -189,6 +190,24 @@ void ota_start_task(void);
  * @see esp_ota_mark_app_invalid_rollback_and_reboot()
  */
 bool ota_diagnostic(void);
+
+/**
+ * @brief Получить текущий прогресс OTA обновления в процентах
+ * @return Прогресс от 0 до 100, или -1 если OTA не активна
+ */
+int ota_get_progress_percent(void);
+
+/**
+ * @brief Получить общий размер загружаемого файла в байтах
+ * @return Размер файла в байтах, или 0 если неизвестно
+ */
+int ota_get_total_size(void);
+
+/**
+ * @brief Получить количество загруженных байт
+ * @return Количество загруженных байт
+ */
+int ota_get_downloaded_bytes(void);
 
 #ifdef __cplusplus
 }

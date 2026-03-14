@@ -22,6 +22,10 @@
 #include "protocol_examples_common.h"
 #include "errno.h"
 #include "ota_client.h"
+#include "hydro_mqtt_client.h"  // Для публикации статуса OTA и версии прошивки
+
+// Объявляем внешнюю переменную для доступа к дескриптору задачи ADS1115
+extern TaskHandle_t ads1115_task_handle;
 
 #if CONFIG_EXAMPLE_CONNECT_WIFI
 #include "esp_wifi.h"
@@ -34,6 +38,11 @@
 static const char *TAG = "ota_client";
 static char ota_write_data[BUFFSIZE + 1] = {0};
 
+// Переменные для отслеживания прогресса OTA
+static int s_ota_downloaded_bytes = 0;     ///< Количество загруженных байт
+static int s_ota_total_bytes = 0;          ///< Общий размер файла
+static bool s_ota_active = false;          ///< Флаг активной OTA сессии
+
 extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
 
@@ -43,10 +52,36 @@ static void http_cleanup(esp_http_client_handle_t client)
     esp_http_client_cleanup(client);
 }
 
-static void __attribute__((noreturn)) task_fatal_error(void)
+/**
+ * @brief Обработчик фатальных ошибок — перезагружает устройство
+ * 
+ * Вызывается при критических ошибках OTA:
+ * - Ошибка сети/SSL
+ * - Ошибка записи во flash
+ * - Повреждение данных
+ * 
+ * Перед перезагрузкой:
+ * 1. Публикует статус ошибки в MQTT
+ * 2. Ждёт 5 секунд (чтобы сообщение дошло до брокера)
+ * 3. Перезагружает устройство
+ * 
+ * @note Функция не возвращает управление - устройство будет перезапущено
+ */
+static void task_fatal_error(void)
 {
-    ESP_LOGE(TAG, "Выход из задачи из-за фатальной ошибки...");
-    vTaskDelete(NULL);
+    ESP_LOGE(TAG, "Фатальная ошибка OTA - перезагрузка устройства...");
+    
+    // Публикуем статус фатальной ошибки
+    mqtt_client_publish_ota_status("fatal_error");
+    
+    // Даём 5 секунд на доставку MQTT сообщения
+    ESP_LOGW(TAG, "Перезагрузка через 5 секунд...");
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    
+    // Перезагружаем устройство
+    esp_restart();
+    
+    // На случай если esp_restart() не сработал
     while (1) { ; }
 }
 
@@ -60,14 +95,43 @@ static void print_sha256(const uint8_t *image_hash, const char *label)
     ESP_LOGI(TAG, "%s: %s", label, hash_print);
 }
 
-static void infinite_loop(void)
+/**
+ * @brief Завершение OTA задачи без обновления
+ *
+ * Вызывается когда версия прошивки совпадает с уже установленной.
+ * Просто завершаем задачу OTA - устройство продолжает работу.
+ *
+ * @param client HTTP клиент для очистки
+ * @param update_handle Дескриптор OTA для прерывания
+ */
+static void ota_exit_no_update(esp_http_client_handle_t client, esp_ota_handle_t update_handle)
 {
-    int i = 0;
-    ESP_LOGI(TAG, "Когда новая прошивка доступна на сервере, нажмите кнопку сброса для загрузки");
-    while (1) {
-        ESP_LOGI(TAG, "Ожидание новой прошивки ... %d", ++i);
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    ESP_LOGW(TAG, "Обновление не требуется - версия прошивки совпадает");
+    ESP_LOGI(TAG, "Для загрузки новой прошивки разместите актуальный файл на сервере");
+
+    // Сбрасываем флаг активной OTA, чтобы задача прогресса корректно завершилась
+    s_ota_active = false;
+    s_ota_downloaded_bytes = 0;
+    s_ota_total_bytes = 0;
+
+    // Очищаем ресурсы и завершаем задачу
+    if (update_handle > 0) {
+        esp_ota_abort(update_handle);
     }
+    http_cleanup(client);
+
+    // Публикуем статус что обновление не требуется
+    mqtt_client_publish_ota_status("no_update");
+
+    // Возобновляем задачу ADS1115 (т.к. OTA не состоялось)
+    // Задача была приостановлена в mqtt_ota_check_task перед запуском OTA
+    if (ads1115_task_handle != NULL) {
+        ESP_LOGI(TAG, "Восстановление задачи ADS1115...");
+        vTaskResume(ads1115_task_handle);
+    }
+
+    // Завершаем задачу OTA - устройство продолжает работу
+    vTaskDelete(NULL);
 }
 
 static void ota_task(void *pvParameter)
@@ -77,6 +141,18 @@ static void ota_task(void *pvParameter)
     const esp_partition_t *update_partition = NULL;
 
     ESP_LOGI(TAG, "Запуск задачи OTA-обновления");
+    
+    // Публикуем текущую версию прошивки
+    esp_app_desc_t running_app_info;
+    if (esp_ota_get_partition_description(esp_ota_get_running_partition(), &running_app_info) == ESP_OK) {
+        ESP_LOGI(TAG, "Текущая версия прошивки: %s", running_app_info.version);
+        mqtt_client_publish_firmware_version(running_app_info.version);
+    }
+    
+    // Инициализируем переменные прогресса
+    s_ota_downloaded_bytes = 0;
+    s_ota_total_bytes = 0;
+    s_ota_active = true;
 
     const esp_partition_t *configured = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -111,7 +187,12 @@ static void ota_task(void *pvParameter)
         esp_http_client_cleanup(client);
         task_fatal_error();
     }
-    esp_http_client_fetch_headers(client);
+    
+    // Получаем длину файла из HTTP заголовков
+    s_ota_total_bytes = esp_http_client_fetch_headers(client);
+    if (s_ota_total_bytes > 0) {
+        ESP_LOGI(TAG, "Размер прошивки: %d байт (%.2f KB)", s_ota_total_bytes, s_ota_total_bytes / 1024.0);
+    }
 
     update_partition = esp_ota_get_next_update_partition(NULL);
     assert(update_partition != NULL);
@@ -151,16 +232,16 @@ static void ota_task(void *pvParameter)
                     if (last_invalid_app != NULL) {
                         if (memcmp(invalid_app_info.version, new_app_info.version, sizeof(new_app_info.version)) == 0) {
                             ESP_LOGW(TAG, "Новая версия совпадает с невалидной версией.");
-                            http_cleanup(client);
-                            infinite_loop();
+                            ESP_LOGE(TAG, "Ранее была попытка запустить прошивку версии %s, но она не удалась", invalid_app_info.version);
+                            ota_exit_no_update(client, update_handle);
                         }
                     }
 
 #ifndef CONFIG_EXAMPLE_SKIP_VERSION_CHECK
                     if (memcmp(new_app_info.version, running_app_info.version, sizeof(new_app_info.version)) == 0) {
                         ESP_LOGW(TAG, "Текущая версия совпадает с новой. Обновление не будет продолжено.");
-                        http_cleanup(client);
-                        infinite_loop();
+                        ESP_LOGI(TAG, "Текущая версия: %s, Новая версия: %s", running_app_info.version, new_app_info.version);
+                        ota_exit_no_update(client, update_handle);
                     }
 #endif
 
@@ -190,6 +271,20 @@ static void ota_task(void *pvParameter)
                 task_fatal_error();
             }
             binary_file_length += data_read;
+            s_ota_downloaded_bytes = binary_file_length;
+            
+            // Выводим прогресс каждые 10%
+            if (s_ota_total_bytes > 0) {
+                int progress = (binary_file_length * 100) / s_ota_total_bytes;
+                if (progress % 10 == 0 && progress > 0) {
+                    static int last_progress = 0;
+                    if (progress != last_progress) {
+                        ESP_LOGI(TAG, "Прогресс загрузки: %d%% (%d/%d байт)", 
+                                progress, binary_file_length, s_ota_total_bytes);
+                        last_progress = progress;
+                    }
+                }
+            }
             ESP_LOGD(TAG, "Длина записанного образа %d", binary_file_length);
         }
         else {
@@ -208,21 +303,37 @@ static void ota_task(void *pvParameter)
 
     if (esp_http_client_is_complete_data_received(client) != true) {
         ESP_LOGE(TAG, "Ошибка при получении полного файла");
+        ESP_LOGE(TAG, "Загружено: %d байт из %d", binary_file_length, s_ota_total_bytes);
+        
+        // Публикуем ошибку
+        mqtt_client_publish_ota_status("error_incomplete");
+        
         http_cleanup(client);
         esp_ota_abort(update_handle);
-        task_fatal_error();
+        
+        // Перезагружаем устройство через 5 секунд
+        ESP_LOGW(TAG, "Перезагрузка через 5 секунд...");
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        esp_restart();
     }
 
     err = esp_ota_end(update_handle);
     if (err != ESP_OK) {
         if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
             ESP_LOGE(TAG, "Ошибка валидации образа, образ поврежден");
+            mqtt_client_publish_ota_status("error_validation");
         }
         else {
             ESP_LOGE(TAG, "Ошибка завершения OTA (%s)!", esp_err_to_name(err));
+            mqtt_client_publish_ota_status("error_finalize");
         }
+        
         http_cleanup(client);
-        task_fatal_error();
+        
+        // Перезагружаем устройство через 5 секунд
+        ESP_LOGW(TAG, "Перезагрузка через 5 секунд...");
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        esp_restart();
     }
 
     err = esp_ota_set_boot_partition(update_partition);
@@ -232,7 +343,47 @@ static void ota_task(void *pvParameter)
         task_fatal_error();
     }
     ESP_LOGI(TAG, "Подготовка к перезагрузке системы!");
+    
+    // Сбрасываем флаг активной OTA
+    s_ota_active = false;
+    s_ota_downloaded_bytes = 0;
+    s_ota_total_bytes = 0;
+    
     esp_restart();
+}
+
+// ============================================================================
+// ФУНКЦИИ ДЛЯ ПОЛУЧЕНИЯ ПРОГРЕССА OTA
+// ============================================================================
+
+/**
+ * @brief Получить текущий прогресс OTA обновления в процентах
+ * @return Прогресс от 0 до 100, или -1 если OTA не активна
+ */
+int ota_get_progress_percent(void)
+{
+    if (!s_ota_active || s_ota_total_bytes <= 0) {
+        return -1;  // OTA не активна
+    }
+    return (s_ota_downloaded_bytes * 100) / s_ota_total_bytes;
+}
+
+/**
+ * @brief Получить общий размер загружаемого файла в байтах
+ * @return Размер файла в байтах, или 0 если неизвестно
+ */
+int ota_get_total_size(void)
+{
+    return s_ota_total_bytes;
+}
+
+/**
+ * @brief Получить количество загруженных байт
+ * @return Количество загруженных байт
+ */
+int ota_get_downloaded_bytes(void)
+{
+    return s_ota_downloaded_bytes;
 }
 
 bool ota_diagnostic(void)

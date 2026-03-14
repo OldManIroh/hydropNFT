@@ -200,6 +200,28 @@ void set_valve_state(bool state);
  */
 bool get_valve_state(void);
 
+/**
+ * @brief Публикация прогресса OTA обновления в MQTT
+ * 
+ * @param progress Прогресс в процентах (0-100)
+ * @param downloaded Количество загруженных байт
+ * @param total Общий размер файла в байтах
+ * 
+ * @note Топик: hydro/ota/progress
+ * @note Формат: {"progress":50,"downloaded":493752,"total":987504}
+ */
+void mqtt_client_publish_ota_progress(int progress, int downloaded, int total);
+
+/**
+ * @brief Публикация версии прошивки в MQTT
+ * 
+ * @param version Строка версии прошивки
+ * 
+ * @note Топик: hydro/firmware/version
+ * @note Пример: "0.2"
+ */
+void mqtt_client_publish_firmware_version(const char *version);
+
 #ifdef __cplusplus
 }
 #endif

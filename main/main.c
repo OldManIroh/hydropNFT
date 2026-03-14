@@ -56,7 +56,7 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "ads1115.h"
-#include "touch_sens_example_config.h"
+// #include "touch_sens_example_config.h"  // Неиспользуемый заголовок
 // #include "water_level_capacitance.h"  // Временно отключен
 #include "dht.h"
 #include "ota_client.h"
@@ -64,11 +64,16 @@
 #include "sntp_client.h"
 
 #ifndef APP_CPU_NUM
-#define APP_CPU_NUM PRO_CPU_NUM  ///< Ядро 1 (APP_CPU) для задач
+#define APP_CPU_NUM 1  ///< Ядро 1 (APP_CPU) для задач
 #endif
 
 // Дескрипторы задач для управления (приостановка при OTA)
-static TaskHandle_t ads1115_task_handle = NULL;  ///< Дескриптор задачи ADS1115
+TaskHandle_t ads1115_task_handle = NULL;  ///< Дескриптор задачи ADS1115
+
+// Объявления функций для работы с OTA прогрессом
+void mqtt_ota_progress_task(void *pvParameters);
+void start_ota_progress_task(void);
+void stop_ota_progress_task(void);
 
 // ============================================================================
 // КОНФИГУРАЦИЯ GPIO
@@ -372,11 +377,17 @@ void mqtt_ota_check_task(void *pvParameters)
                 ESP_LOGI(TAG, "Задача ADS1115 приостановлена");
             }
 
+            // Запускаем задачу публикации прогресса OTA
+            start_ota_progress_task();
+
             // Запускаем задачу OTA обновления
             // После этого устройство загрузит новую прошивку и перезагрузится
+            // ИЛИ версии совпадут и OTA не состоится (задача ADS1115 будет восстановлена)
             ota_start_task();
-            
+
             // НЕ восстанавливаем ADS1115 - устройство скоро перезагрузится
+            // Если OTA не состоялось (версии совпали), ota_exit_no_update()
+            // восстановит задачу ADS1115
         }
 
         // Пауза 1 секунда перед следующей проверкой
@@ -434,6 +445,123 @@ void mqtt_time_publish_task(void *pvParameters)
     }
 }
 */
+
+// ============================================================================
+// ЗАДАЧА ПУБЛИКАЦИИ ПРОГРЕССА OTA В MQTT
+// ============================================================================
+
+// Дескриптор задачи публикации прогресса OTA
+static TaskHandle_t ota_progress_task_handle = NULL;
+
+/**
+ * @brief Задача для публикации прогресса OTA обновления в MQTT
+ * 
+ * Периодически публикует текущий прогресс загрузки прошивки
+ * в топик hydro/ota/progress в формате JSON.
+ * 
+ * @param pvParameters Параметры задачи (не используются)
+ * 
+ * @note Задача работает на ядре 0 (PRO_CPU)
+ * @note Приоритет: 4 (средний)
+ * @note Размер стека: configMINIMAL_STACK_SIZE * 3 = 768 байт
+ * @note Задача удаляет себя сама после завершения OTA
+ */
+void mqtt_ota_progress_task(void *pvParameters)
+{
+    char json_msg[128];  // Буфер для JSON сообщения
+    int last_progress = -1;  // Последний отправленный прогресс
+    int no_change_count = 0;  // Счётчик циклов без изменений
+    int total = 0;
+    int downloaded = 0;
+    
+    ESP_LOGI(TAG, "Задача публикации прогресса OTA запущена");
+    
+    while (1) {
+        // Получаем текущий прогресс OTA
+        int progress = ota_get_progress_percent();
+        
+        // Если OTA активна (прогресс >= 0)
+        if (progress >= 0) {
+            total = ota_get_total_size();
+            downloaded = ota_get_downloaded_bytes();
+            
+            // Формируем JSON сообщение
+            snprintf(json_msg, sizeof(json_msg),
+                    "{\"progress\":%d,\"downloaded\":%d,\"total\":%d}",
+                    progress, downloaded, total);
+            
+            // Публикуем в MQTT топик через mqtt_client
+            mqtt_client_publish_ota_progress(progress, downloaded, total);
+            
+            ESP_LOGI(TAG, "OTA прогресс: %d%% (%d/%d)", progress, downloaded, total);
+            last_progress = progress;
+            no_change_count = 0;
+        }
+        // Если OTA не активна - проверяем не завершилась ли она
+        else {
+            no_change_count++;
+            
+            // Если прогресс не меняется 3 секунды - OTA завершена
+            if (no_change_count >= 3) {
+                ESP_LOGI(TAG, "OTA сессия завершена (прогресс: %d%%)", last_progress);
+                
+                // Если прогресс был 100% - всё успешно
+                if (last_progress == 100) {
+                    mqtt_client_publish_ota_status("completed");
+                }
+                
+                ESP_LOGI(TAG, "Задача публикации прогресса OTA завершается");
+                
+                // Сбрасываем дескриптор и удаляем задачу
+                ota_progress_task_handle = NULL;
+                vTaskDelete(NULL);
+            }
+        }
+        
+        // Пауза 1 секунда
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/**
+ * @brief Запуск задачи публикации прогресса OTA
+ * 
+ * Создаёт задачу для мониторинга и публикации прогресса OTA обновления.
+ * Задача автоматически удаляет себя после завершения OTA.
+ * 
+ * @note Вызывается при запуске OTA обновления
+ * @note Задача работает на ядре 0 (PRO_CPU)
+ */
+void start_ota_progress_task(void)
+{
+    if (ota_progress_task_handle == NULL) {
+        xTaskCreatePinnedToCore(
+            mqtt_ota_progress_task,
+            "mqtt_ota_progress_task",
+            configMINIMAL_STACK_SIZE * 3,  // 768 байт
+            NULL,
+            4,
+            &ota_progress_task_handle,
+            PRO_CPU_NUM  // Ядро 0
+        );
+        ESP_LOGI(TAG, "Задача публикации прогресса OTA создана");
+    }
+}
+
+/**
+ * @brief Остановка задачи публикации прогресса OTA
+ * 
+ * Принудительно удаляет задачу публикации прогресса.
+ * Используется при ошибках OTA.
+ */
+void stop_ota_progress_task(void)
+{
+    if (ota_progress_task_handle != NULL) {
+        vTaskDelete(ota_progress_task_handle);
+        ota_progress_task_handle = NULL;
+        ESP_LOGI(TAG, "Задача публикации прогресса OTA остановлена");
+    }
+}
 
 // ============================================================================
 // ГЛАВНАЯ ФУНКЦИЯ ПРИЛОЖЕНИЯ
@@ -535,7 +663,7 @@ void app_main(void)
 
     /*
      * Создаёт MQTT клиента и подключается к брокеру:
-     * - Broker: mqtt://192.168.0.105:1883
+     * - Broker: mqtt://192.168.0.107:1883
      * - Username: hydroesp32
      * - Password: asda
      *
@@ -616,6 +744,19 @@ void app_main(void)
         NULL,
         PRO_CPU_NUM  // Ядро 0
     );
+
+    // Задача публикации прогресса OTA ОТКЛЮЧЕНА
+    // Задача создаётся динамически при запуске OTA (start_ota_progress_task)
+    // и удаляется после завершения обновления
+    // xTaskCreatePinnedToCore(
+    //     mqtt_ota_progress_task,
+    //     "mqtt_ota_progress_task",
+    //     configMINIMAL_STACK_SIZE * 3,
+    //     NULL,
+    //     4,
+    //     NULL,
+    //     PRO_CPU_NUM
+    // );
 
     // Задача публикации времени в MQTT ОТКЛЮЧЕНА
     // Время синхронизируется через SNTP, но не публикуется в MQTT
