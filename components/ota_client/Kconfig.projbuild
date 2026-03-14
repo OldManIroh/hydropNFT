@@ -1,0 +1,27 @@
+menu "OTA Client Configuration"
+
+config EXAMPLE_FIRMWARE_UPG_URL
+    string "Firmware Upgrade URL"
+    default "https://example.com/firmware.bin"
+    help
+        URL для загрузки прошивки
+
+config EXAMPLE_OTA_RECV_TIMEOUT
+    int "OTA Receive Timeout (ms)"
+    default 30000
+    help
+        Таймаут получения данных OTA
+
+config EXAMPLE_GPIO_DIAGNOSTIC
+    int "GPIO for Diagnostic"
+    default 0
+    help
+        GPIO пин для диагностики после OTA
+
+config EXAMPLE_CONNECT_WIFI
+    bool "Connect using Wi-Fi"
+    default y
+    help
+        Использовать Wi-Fi для подключения
+
+endmenu

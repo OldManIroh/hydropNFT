@@ -1,0 +1,16 @@
+dependencies:
+  esp-idf-lib/ads111x:
+    version: '*'
+  esp-idf-lib/esp_idf_lib_helpers:
+    version: '*'
+  esp-idf-lib/i2cdev:
+    version: '*'
+  touch_sens_examples_common:
+    path: 
+      ${IDF_PATH}/examples/peripherals/touch_sensor/touch_sens_examples_common
+  protocol_examples_common:
+    path: ${IDF_PATH}/examples/common_components/protocol_examples_common
+
+  espressif/touch_button: ^0.1.0~1
+description: default
+version: 1.0.0
