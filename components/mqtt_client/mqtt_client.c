@@ -27,6 +27,7 @@
 #include "protocol_examples_common.h"
 #include "mqtt_client.h"           // Заголовочный файл ESP-IDF MQTT библиотеки
 #include "hydro_mqtt_client.h"     // Локальный заголовочный файл компонента
+#include "esp_ota_ops.h"           // Для получения версии прошивки
 
 /// Тег для системы логирования ESP-IDF
 static const char *TAG = "mqtt_client";
@@ -75,6 +76,14 @@ static int read_tds(void) { return 500 + rand() % 50; }
  * @note ЗАМЕНИТЕ на реальное чтение с емкостного датчика
  */
 static int read_level(void) { return 75 + rand() % 10; }
+
+/**
+ * @brief Чтение значения температуры воды
+ * @return Температура воды в °C (22.0 - 26.9) - случайное значение для тестирования
+ *
+ * @note ЗАМЕНИТЕ на реальное чтение с ADS1115 канал 1
+ */
+static float read_water_temp(void) { return 22.0f + (rand() % 50) / 10.0f; }
 
 // ============================================================================
 // ВНЕШНИЕ ПЕРЕМЕННЫЕ (из main.c)
@@ -142,7 +151,7 @@ static void send_discovery_sensor(esp_mqtt_client_handle_t client, const char *o
                  "\"unique_id\":\"esp32_hydro_%s\"," // Уникальный ID
                  "\"device\":{"                // Информация об устройстве
                  "\"identifiers\":[\"esp32_hydro_controller\"]," // ID устройства
-                 "\"name\":\"Hydro Controller\","
+                 "\"name\":\"Hydroponic system\","
                  "\"model\":\"ESP32\","
                  "\"manufacturer\":\"HydroNFT\""
                  "}}",
@@ -156,7 +165,7 @@ static void send_discovery_sensor(esp_mqtt_client_handle_t client, const char *o
                  "\"unique_id\":\"esp32_hydro_%s\","
                  "\"device\":{"
                  "\"identifiers\":[\"esp32_hydro_controller\"],"
-                 "\"name\":\"Hydro Controller\","
+                 "\"name\":\"Hydroponic system\","
                  "\"model\":\"ESP32\","
                  "\"manufacturer\":\"HydroNFT\""
                  "}}",
@@ -204,7 +213,7 @@ static void send_discovery_switch(esp_mqtt_client_handle_t client, const char *o
              "\"unique_id\":\"esp32_hydro_%s\","
              "\"device\":{"
              "\"identifiers\":[\"esp32_hydro_controller\"],"
-             "\"name\":\"Hydro Controller\","
+             "\"name\":\"Hydroponic system\","
              "\"model\":\"ESP32\","
              "\"manufacturer\":\"HydroNFT\""
              "}}",
@@ -243,9 +252,11 @@ static void send_discovery_button(esp_mqtt_client_handle_t client, const char *o
              "\"command_topic\":\"%s\","
              "\"payload_press\":\"%s\","
              "\"unique_id\":\"esp32_hydro_%s\","
+             "\"device_class\":\"restart\","
+             "\"entity_category\":\"diagnostic\","
              "\"device\":{"
              "\"identifiers\":[\"esp32_hydro_controller\"],"
-             "\"name\":\"Hydro Controller\","
+             "\"name\":\"Hydroponic system\","
              "\"model\":\"ESP32\","
              "\"manufacturer\":\"HydroNFT\""
              "}}",
@@ -268,14 +279,14 @@ static void send_discovery_firmware_version(esp_mqtt_client_handle_t client)
     snprintf(topic, sizeof(topic), "homeassistant/sensor/hydroesp32/firmware_version/config");
     
     snprintf(payload, sizeof(payload),
-             "{\"name\":\"Firmware Version\","
+             "{\"name\":\"Версия прошивки\","
              "\"state_topic\":\"hydro/firmware/version\","
              "\"unique_id\":\"esp32_hydro_firmware_version\","
              "\"icon\":\"mdi:chip\","
              "\"entity_category\":\"diagnostic\","
              "\"device\":{"
              "\"identifiers\":[\"esp32_hydro_controller\"],"
-             "\"name\":\"Hydro Controller\","
+             "\"name\":\"Hydroponic system\","
              "\"model\":\"ESP32\","
              "\"manufacturer\":\"HydroNFT\""
              "}}");
@@ -297,7 +308,7 @@ static void send_discovery_ota_progress(esp_mqtt_client_handle_t client)
     snprintf(topic, sizeof(topic), "homeassistant/sensor/hydroesp32/ota_progress/config");
     
     snprintf(payload, sizeof(payload),
-             "{\"name\":\"OTA Progress\","
+             "{\"name\":\"Прогресс обновления\","
              "\"state_topic\":\"hydro/ota/progress\","
              "\"unique_id\":\"esp32_hydro_ota_progress\","
              "\"unit_of_measurement\":\"%%\","
@@ -306,7 +317,7 @@ static void send_discovery_ota_progress(esp_mqtt_client_handle_t client)
              "\"entity_category\":\"diagnostic\","
              "\"device\":{"
              "\"identifiers\":[\"esp32_hydro_controller\"],"
-             "\"name\":\"Hydro Controller\","
+             "\"name\":\"Hydroponic system\","
              "\"model\":\"ESP32\","
              "\"manufacturer\":\"HydroNFT\""
              "}}");
@@ -328,14 +339,14 @@ static void send_discovery_ota_status(esp_mqtt_client_handle_t client)
     snprintf(topic, sizeof(topic), "homeassistant/sensor/hydroesp32/ota_status/config");
     
     snprintf(payload, sizeof(payload),
-             "{\"name\":\"OTA Status\","
+             "{\"name\":\"Статус обновления\","
              "\"state_topic\":\"hydro/ota/status\","
              "\"unique_id\":\"esp32_hydro_ota_status\","
              "\"icon\":\"mdi:state-machine\","
              "\"entity_category\":\"diagnostic\","
              "\"device\":{"
              "\"identifiers\":[\"esp32_hydro_controller\"],"
-             "\"name\":\"Hydro Controller\","
+             "\"name\":\"Hydroponic system\","
              "\"model\":\"ESP32\","
              "\"manufacturer\":\"HydroNFT\""
              "}}");
@@ -400,36 +411,40 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // Отправляем конфигурации для Home Assistant Discovery
             // После этого HA автоматически обнаружит наши сенсоры и выключатели
 
-            // Сенсоры
-            // pH - используем device_class "pH"
-            send_discovery_sensor(mqtt_client, "ph", "pH Level", "", "pH", "hydro/sensor/ph/state");
-            // TDS - используем device_class "conductivity" (проводимость)
-            send_discovery_sensor(mqtt_client, "tds", "TDS", "ppm", "conductivity", "hydro/sensor/tds/state");
-            // Уровень воды - без device_class (пустая строка)
-            send_discovery_sensor(mqtt_client, "water_level", "Water Level", "%", "", "hydro/sensor/level/state");
-            // Температура (DHT) - используем device_class "temperature"
-            send_discovery_sensor(mqtt_client, "temperature", "Temperature", "°C", "temperature", "hydro/sensor/temperature/state");
-            // Влажность (DHT) - используем device_class "humidity"
-            send_discovery_sensor(mqtt_client, "humidity", "Humidity", "%", "humidity", "hydro/sensor/humidity/state");
-            
-            // Сенсоры OTA
-            // Версия прошивки
-            send_discovery_firmware_version(mqtt_client);
-            // Прогресс OTA
-            send_discovery_ota_progress(mqtt_client);
-            // Статус OTA
-            send_discovery_ota_status(mqtt_client);
+            // === Сенсоры (в порядке отображения в HA) ===
+            // 1. Уровень воды
+            send_discovery_sensor(mqtt_client, "water_level", "Уровень воды", "%", "", "hydro/sensor/level/state");
+            // 2. Уровень pH
+            send_discovery_sensor(mqtt_client, "ph", "Уровень pH", "", "pH", "hydro/sensor/ph/state");
+            // 3. Температура воды (ADS1115 канал 1)
+            send_discovery_sensor(mqtt_client, "water_temp", "Температура воды", "°C", "temperature", "hydro/sensor/water_temp/state");
+            // 4. Солесодержание (TDS)
+            send_discovery_sensor(mqtt_client, "tds", "Солесодержание (TDS)", "ppm", "", "hydro/sensor/tds/state");
+            // 5. Влажность (DHT)
+            send_discovery_sensor(mqtt_client, "humidity", "Влажность", "%", "humidity", "hydro/sensor/humidity/state");
+            // 6. Температура помещения (DHT)
+            send_discovery_sensor(mqtt_client, "temperature", "Температура помещения", "°C", "temperature", "hydro/sensor/temperature/state");
 
-            // Выключатели
-            send_discovery_switch(mqtt_client, "pump", "Circulation Pump",
+            // === Выключатели ===
+            // 7. Насос циркуляции
+            send_discovery_switch(mqtt_client, "pump", "Насос циркуляции",
                                   "hydro/switch/pump/set", "hydro/switch/pump/state");
-            send_discovery_switch(mqtt_client, "light", "Grow Light",
+            // 8. Фитолампа
+            send_discovery_switch(mqtt_client, "light", "Фитолампа",
                                   "hydro/switch/light/set", "hydro/switch/light/state");
-            send_discovery_switch(mqtt_client, "valve", "Water Valve",
+            // 9. Клапан воды
+            send_discovery_switch(mqtt_client, "valve", "Клапан воды",
                                   "hydro/switch/valve/set", "hydro/switch/valve/state");
 
-            // Кнопка OTA обновления
-            send_discovery_button(mqtt_client, "ota_update", "Start OTA Update",
+            // === Диагностика ===
+            // 10. Версия прошивки
+            send_discovery_firmware_version(mqtt_client);
+            // 11. Статус обновления
+            send_discovery_ota_status(mqtt_client);
+            // 12. Прогресс обновления
+            send_discovery_ota_progress(mqtt_client);
+            // 13. Кнопка обновления прошивки
+            send_discovery_button(mqtt_client, "ota_update", "Обновление прошивки",
                                   "hydro/ota/update", "START");
 
             // Подписываемся на топики команд
@@ -448,6 +463,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             
             // Публикуем статус OTA
             mqtt_client_publish_ota_status("idle");
+
+            // Публикуем текущую версию прошивки при каждом подключении к MQTT
+            // Это гарантирует, что после OTA обновления и перезагрузки
+            // новая версия будет отображена в Home Assistant
+            {
+                esp_app_desc_t app_info;
+                if (esp_ota_get_partition_description(esp_ota_get_running_partition(), &app_info) == ESP_OK) {
+                    mqtt_client_publish_firmware_version(app_info.version);
+                    ESP_LOGI(TAG, "Published firmware version on connect: %s", app_info.version);
+                }
+            }
             break;
 
         // ================================================================
@@ -671,6 +697,10 @@ void mqtt_client_publish_sensor_data(void)
         // Публикация уровня воды
         snprintf(msg, sizeof(msg), "%d", read_level());
         esp_mqtt_client_publish(mqtt_client, "hydro/sensor/level/state", msg, 0, 0, 0);
+
+        // Публикация температуры воды (ADS1115 канал 1)
+        snprintf(msg, sizeof(msg), "%.1f", read_water_temp());
+        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/water_temp/state", msg, 0, 0, 0);
 
         // Публикация данных DHT (температура и влажность)
         float temp = get_dht_temperature();
