@@ -8,9 +8,9 @@ config EXAMPLE_FIRMWARE_UPG_URL
 
 config EXAMPLE_OTA_RECV_TIMEOUT
     int "OTA Receive Timeout (ms)"
-    default 30000
+    default 60000
     help
-        Таймаут получения данных OTA
+        Таймаут получения данных OTA (увеличен до 60 сек для медленного Wi-Fi)
 
 config EXAMPLE_GPIO_DIAGNOSTIC
     int "GPIO for Diagnostic"

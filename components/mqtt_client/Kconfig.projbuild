@@ -10,4 +10,16 @@ menu "Example Configuration"
         bool
         default y if BROKER_URL = "FROM_STDIN"
 
+    config LIGHT_ON_HOUR
+        int "Light ON hour"
+        default 8
+        help
+            Hour of day (0-23) when to turn on the light.
+
+    config LIGHT_OFF_HOUR
+        int "Light OFF hour"
+        default 0
+        help
+            Hour of day (0-23) when to turn off the light.
+
 endmenu

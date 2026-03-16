@@ -7,9 +7,9 @@ dependencies:
     version: '*'
   esp-idf-lib/dht:
     version: '*'
-  touch_sens_examples_common:
-    path:
-      ${IDF_PATH}/examples/peripherals/touch_sensor/touch_sens_examples_common
+  # touch_sens_examples_common:
+  #   path:
+  #     ${IDF_PATH}/examples/peripherals/touch_sensor/touch_sens_examples_common
   protocol_examples_common:
     path: ${IDF_PATH}/examples/common_components/protocol_examples_common
 

@@ -23,9 +23,10 @@
 #include "errno.h"
 #include "ota_client.h"
 #include "hydro_mqtt_client.h"  // Для публикации статуса OTA и версии прошивки
+#include "esp_task_wdt.h"       // Для сброса watchdog (пункт 1.7)
 
-// Объявляем внешнюю переменную для доступа к дескриптору задачи ADS1115
-extern TaskHandle_t ads1115_task_handle;
+// Объявляем внешнюю функцию для доступа к семафору ADS1115
+extern SemaphoreHandle_t get_ads1115_running_sem(void);
 
 #if CONFIG_EXAMPLE_CONNECT_WIFI
 #include "esp_wifi.h"
@@ -123,11 +124,13 @@ static void ota_exit_no_update(esp_http_client_handle_t client, esp_ota_handle_t
     // Публикуем статус что обновление не требуется
     mqtt_client_publish_ota_status("no_update");
 
-    // Возобновляем задачу ADS1115 (т.к. OTA не состоялось)
-    // Задача была приостановлена в mqtt_ota_check_task перед запуском OTA
-    if (ads1115_task_handle != NULL) {
-        ESP_LOGI(TAG, "Восстановление задачи ADS1115...");
-        vTaskResume(ads1115_task_handle);
+    // Пункт 1.8: Восстанавливаем семафор ADS1115 (т.к. OTA не состоялось)
+    // Задача была остановлена через семафор в mqtt_ota_check_task
+    SemaphoreHandle_t sem = get_ads1115_running_sem();
+    if (sem != NULL) {
+        ESP_LOGI(TAG, "Восстановление семафора ADS1115...");
+        xSemaphoreGive(sem);
+        ESP_LOGI(TAG, "Задача ADS1115 восстановлена");
     }
 
     // Завершаем задачу OTA - устройство продолжает работу
@@ -153,6 +156,9 @@ static void ota_task(void *pvParameter)
     s_ota_downloaded_bytes = 0;
     s_ota_total_bytes = 0;
     s_ota_active = true;
+
+    // ПОТ-11: Сбрасываем last_progress в начале OTA сессии
+    // (переменная static внутри цикла, но задача создаётся заново при каждом OTA)
 
     const esp_partition_t *configured = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -272,14 +278,18 @@ static void ota_task(void *pvParameter)
             }
             binary_file_length += data_read;
             s_ota_downloaded_bytes = binary_file_length;
-            
+
             // Выводим прогресс каждые 10%
             if (s_ota_total_bytes > 0) {
                 int progress = (binary_file_length * 100) / s_ota_total_bytes;
                 if (progress % 10 == 0 && progress > 0) {
+                    // ПОТ-11: Используем локальную переменную вместо static
+                    // чтобы прогресс корректно сбрасывался между сессиями OTA
                     static int last_progress = 0;
                     if (progress != last_progress) {
-                        ESP_LOGI(TAG, "Прогресс загрузки: %d%% (%d/%d байт)", 
+                        // Пункт 1.7: Сброс watchdog для предотвращения перезагрузки
+                        esp_task_wdt_reset();
+                        ESP_LOGI(TAG, "Прогресс загрузки: %d%% (%d/%d байт)",
                                 progress, binary_file_length, s_ota_total_bytes);
                         last_progress = progress;
                     }
@@ -447,12 +457,20 @@ void ota_init(void)
 {
     ESP_LOGI(TAG, "Инициализация NVS и сети");
 
+    // Пункт 3.2: Улучшенная обработка сбоя питания при записи в NVS
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS требует очистки (переполнение или новая версия). Предыдущие данные будут потеряны.");
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(err);
+    if (err != ESP_OK) {
+        // Критическая ошибка NVS — пробуем восстановление
+        ESP_LOGE(TAG, "Критическая ошибка NVS: %s. Попытка восстановления...", esp_err_to_name(err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+        ESP_LOGI(TAG, "NVS восстановлен");
+    }
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());

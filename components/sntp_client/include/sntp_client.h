@@ -1,30 +1,38 @@
 /**
  * @file sntp_client.h
  * @brief Клиент SNTP для синхронизации времени с NTP серверами
- * 
+ *
  * Этот компонент реализует получение и синхронизацию системного времени
  * через протокол SNTP (Simple Network Time Protocol).
- * 
+ *
  * Функционал:
- * - Подключение к публичным NTP серверам (включая Яндекс, Google, pool.ntp.org)
+ * - Подключение к публичным NTP серверам (настраиваются через Kconfig)
  * - Автоматическая повторная попытка при ошибке
  * - Уведомление об успешной синхронизации через callback
  * - Получение отформатированной строки времени
- * 
+ *
  * Пример использования:
  * @code
  * void app_main(void) {
- *     // Инициализация SNTP (после подключения к Wi-Fi)
+ *     // Предполагается, что WiFi уже подключён (например, через mqtt_client)
+ *
+ *     // Инициализация SNTP
  *     sntp_client_init();
- *     
- *     // В цикле можно получать текущее время
+ *
+ *     // Синхронизация времени (блокируется до успеха или таймаута)
+ *     if (!sntp_time_sync()) {
+ *         ESP_LOGE(TAG, "Не удалось синхронизировать время");
+ *         return;
+ *     }
+ *
+ *     // Теперь можно использовать время
  *     char time_str[32];
  *     if (sntp_client_get_time_string(time_str, sizeof(time_str))) {
  *         printf("Текущее время: %s\n", time_str);
  *     }
  * }
  * @endcode
- * 
+ *
  * @author HydroNFT Team
  * @version 1.0
  * @date 2024
@@ -43,25 +51,54 @@ extern "C" {
 
 /**
  * @brief Инициализация SNTP клиента
- * 
+ *
  * Настраивает и запускает SNTP клиент для синхронизации времени.
- * Использует следующие NTP серверы (в порядке приоритета):
- * - ntp.msk-ix.ru (Московский IX)
- * - ru.pool.ntp.org (Российский pool)
- * - pool.ntp.org (Глобальный pool)
- * - time.google.com (Google)
- * 
+ * Использует следующие NTP серверы (из Kconfig):
+ * - CONFIG_SNTP_SERVER_1 (основной)
+ * - CONFIG_SNTP_SERVER_2
+ * - CONFIG_SNTP_SERVER_3
+ * - CONFIG_SNTP_SERVER_4
+ *
  * При успешной синхронизации вызывается callback функция,
  * которая логирует текущее время.
- * 
+ *
  * @note Функция не блокирующая - синхронизация происходит в фоне
  * @note Требуется активное подключение к интернету (Wi-Fi/Ethernet)
  * @note Вызывается один раз после инициализации сети
- * 
+ *
+ * @see sntp_time_sync()
  * @see sntp_client_get_time_string()
  * @see sntp_client_is_synced()
  */
 void sntp_client_init(void);
+
+/**
+ * @brief Синхронизация времени через SNTP
+ *
+ * Ожидает синхронизации времени с NTP серверами, настроенными в Kconfig:
+ * - CONFIG_SNTP_SERVER_1 (основной)
+ * - CONFIG_SNTP_SERVER_2
+ * - CONFIG_SNTP_SERVER_3
+ * - CONFIG_SNTP_SERVER_4
+ *
+ * Функция блокируется до успешной синхронизации или исчерпания попыток.
+ *
+ * @return true если синхронизация успешна
+ * @return false если не удалось синхронизировать время
+ *
+ * @note Требуется активное подключение к WiFi перед вызовом
+ * @note Использует CONFIG_SNTP_SYNC_RETRY_COUNT для максимального числа попыток
+ *
+ * Пример:
+ * @code
+ * if (sntp_time_sync()) {
+ *     // Время синхронизировано
+ * }
+ * @endcode
+ *
+ * @see sntp_client_init()
+ */
+bool sntp_time_sync(void);
 
 /**
  * @brief Проверка состояния синхронизации времени

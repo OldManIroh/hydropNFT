@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -28,6 +29,8 @@
 #include "mqtt_client.h"           // Заголовочный файл ESP-IDF MQTT библиотеки
 #include "hydro_mqtt_client.h"     // Локальный заголовочный файл компонента
 #include "esp_ota_ops.h"           // Для получения версии прошивки
+#include "main.h"                  // Для функций управления GPIO и получения данных DHT
+#include "ads1115.h"               // Для получения данных с ADS1115
 
 /// Тег для системы логирования ESP-IDF
 static const char *TAG = "mqtt_client";
@@ -36,70 +39,19 @@ static const char *TAG = "mqtt_client";
 static esp_mqtt_client_handle_t mqtt_client;
 
 /// Флаг состояния подключения к MQTT брокеру
-static bool mqtt_connected = false;
+static _Atomic bool mqtt_connected = false;
 
 /// Флаг запроса OTA обновления - устанавливается при получении команды из MQTT
 /// Используется в main.c для запуска процесса обновления прошивки
-static bool ota_update_requested = false;
+static _Atomic bool ota_update_requested = false;
 
 /// @brief Состояния выключателей
 /// @{
-static bool pump_state = false;   ///< Насос циркуляции - выключен по умолчанию
-static bool light_state = false;  ///< Фитолампа - выключена по умолчанию
-static bool valve_state = false;  ///< Клапан - выключен по умолчанию
+static _Atomic bool pump_state = false;   ///< Насос циркуляции - выключен по умолчанию
+static _Atomic bool light_state = false;  ///< Фитолампа - выключена по умолчанию
+static _Atomic bool valve_state = false;  ///< Клапан - выключен по умолчанию
 /// @}
 
-// ============================================================================
-// ЗАГЛУШКИ ДАТЧИКОВ (замените на реальные функции чтения)
-// ============================================================================
-
-/**
- * @brief Чтение значения pH датчика
- * @return Значение pH (6.8 - 7.7) - случайное значение для тестирования
- *
- * @note ЗАМЕНИТЕ на реальное чтение с ADC через ADS1115
- */
-static float read_ph(void) { return 6.8f + (rand() % 10) / 10.0f; }
-
-/**
- * @brief Чтение значения TDS датчика
- * @return Значение TDS в ppm (500 - 549) - случайное значение для тестирования
- *
- * @note ЗАМЕНИТЕ на реальное чтение с ADC через ADS1115
- */
-static int read_tds(void) { return 500 + rand() % 50; }
-
-/**
- * @brief Чтение значения уровня воды
- * @return Уровень воды в процентах (75 - 84) - случайное значение для тестирования
- *
- * @note ЗАМЕНИТЕ на реальное чтение с емкостного датчика
- */
-static int read_level(void) { return 75 + rand() % 10; }
-
-/**
- * @brief Чтение значения температуры воды
- * @return Температура воды в °C (22.0 - 26.9) - случайное значение для тестирования
- *
- * @note ЗАМЕНИТЕ на реальное чтение с ADS1115 канал 1
- */
-static float read_water_temp(void) { return 22.0f + (rand() % 50) / 10.0f; }
-
-// ============================================================================
-// ВНЕШНИЕ ПЕРЕМЕННЫЕ (из main.c)
-// ============================================================================
-
-/**
- * @brief Получить температуру с DHT датчика
- * @return Температура в °C
- */
-extern float get_dht_temperature(void);
-
-/**
- * @brief Получить влажность с DHT датчика
- * @return Влажность в %
- */
-extern float get_dht_humidity(void);
 
 // ============================================================================
 // HOME ASSISTANT MQTT DISCOVERY
@@ -480,7 +432,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // СОБЫТИЕ: ОТКЛЮЧЕНИЕ ОТ БРОКЕРА
         // ================================================================
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "MQTT disconnected");
+            ESP_LOGW(TAG, "MQTT disconnected. ESP-MQTT автоматически пытается переподключиться...");
             mqtt_connected = false;
             break;
 
@@ -506,12 +458,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 if (strcmp(data, "ON") == 0) {
                     pump_state = true;
                     ESP_LOGI(TAG, "Pump: ON");
-                    // Здесь будет реальное включение насоса через GPIO
-                    // gpio_set_level(PUMP_PIN, 1);
+                    // Включаем насос через GPIO
+                    set_pump_state(true);
                 } else if (strcmp(data, "OFF") == 0) {
                     pump_state = false;
                     ESP_LOGI(TAG, "Pump: OFF");
-                    // gpio_set_level(PUMP_PIN, 0);
+                    set_pump_state(false);
                 }
                 // Отправляем подтверждение состояния обратно в HA
                 publish_switch_state("hydro/switch/pump/state", pump_state);
@@ -525,12 +477,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             else if (strcmp(topic, "hydro/switch/light/set") == 0) {
                 if (strcmp(data, "ON") == 0) {
                     light_state = true;
-                    ESP_LOGI(TAG, "Light: ON");
-                    // gpio_set_level(LIGHT_PIN, 1);
+                    ESP_LOGI(TAG, "Light: ON (ручное управление)");
+                    set_light_state(true, true);  // true = ручное управление
                 } else if (strcmp(data, "OFF") == 0) {
                     light_state = false;
-                    ESP_LOGI(TAG, "Light: OFF");
-                    // gpio_set_level(LIGHT_PIN, 0);
+                    ESP_LOGI(TAG, "Light: OFF (ручное управление)");
+                    set_light_state(false, true);  // true = ручное управление
                 }
                 publish_switch_state("hydro/switch/light/state", light_state);
             }
@@ -672,35 +624,46 @@ void mqtt_client_publish_ota_status(const char *status)
 /**
  * @brief Публикация данных сенсоров в MQTT
  * 
- * Читает значения с датчиков и публикует их в соответствующие топики:
- * - hydro/sensor/ph/state - pH значение
- * - hydro/sensor/tds/state - TDS значение (ppm)
- * - hydro/sensor/level/state - Уровень воды (%)
+ * Читает реальные значения напряжений с ADS1115 и публикует в топики:
+ * - hydro/sensor/ph/state - Напряжение pH датчика (канал 0), В
+ * - hydro/sensor/tds/state - Напряжение TDS датчика (канал 2), В
+ * - hydro/sensor/level/state - Напряжение датчика уровня (канал 3), В
+ * - hydro/sensor/water_temp/state - Напряжение датчика температуры воды (канал 1), В
+ * 
+ * Каналы ADS1115:
+ * - 0: pH датчик
+ * - 1: Температура воды
+ * - 2: TDS датчик
+ * - 3: Уровень воды
  * 
  * @note Вызывается периодически из mqtt_sensor_task() в main.c
- * @note Рекомендуется интервал вызова: 5-10 секунд
- * @note ЗАМЕНИТЕ заглушки read_*() на реальные функции чтения с ADC
+ * @note Публикуются значения напряжений в вольтах (без калибровки)
  */
 void mqtt_client_publish_sensor_data(void)
 {
     if (mqtt_connected && mqtt_client) {
         char msg[64];  // Буфер для строкового представления значения
 
-        // Публикация pH
-        snprintf(msg, sizeof(msg), "%.2f", read_ph());
-        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/ph/state", msg, 0, 0, 0);
+        // ЛОГ-1: Получаем реальные данные с ADS1115 вместо заглушек
+        const ads1115_sensor_data_t *sensor_data = ads1115_get_latest_data();
 
-        // Публикация TDS
-        snprintf(msg, sizeof(msg), "%d", read_tds());
-        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/tds/state", msg, 0, 0, 0);
+        if (sensor_data->valid) {
+            // Публикация напряжения pH датчика (канал 0)
+            snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[0]);
+            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/ph/state", msg, 0, 0, 0);
 
-        // Публикация уровня воды
-        snprintf(msg, sizeof(msg), "%d", read_level());
-        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/level/state", msg, 0, 0, 0);
+            // Публикация напряжения TDS датчика (канал 2)
+            snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[2]);
+            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/tds/state", msg, 0, 0, 0);
 
-        // Публикация температуры воды (ADS1115 канал 1)
-        snprintf(msg, sizeof(msg), "%.1f", read_water_temp());
-        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/water_temp/state", msg, 0, 0, 0);
+            // Публикация напряжения датчика уровня воды (канал 3)
+            snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[3]);
+            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/level/state", msg, 0, 0, 0);
+
+            // Публикация напряжения датчика температуры воды (канал 1)
+            snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[1]);
+            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/water_temp/state", msg, 0, 0, 0);
+        }
 
         // Публикация данных DHT (температура и влажность)
         float temp = get_dht_temperature();

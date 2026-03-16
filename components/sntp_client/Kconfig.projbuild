@@ -1,0 +1,33 @@
+menu "SNTP Client Configuration"
+
+    config SNTP_SERVER_1
+        string "Primary NTP Server"
+        default "ntp.msk-ix.ru"
+        help
+            Primary NTP server for time synchronization.
+
+    config SNTP_SERVER_2
+        string "Secondary NTP Server"
+        default "ru.pool.ntp.org"
+        help
+            Secondary NTP server for time synchronization.
+
+    config SNTP_SERVER_3
+        string "Tertiary NTP Server"
+        default "pool.ntp.org"
+        help
+            Tertiary NTP server for time synchronization.
+
+    config SNTP_SERVER_4
+        string "Quaternary NTP Server"
+        default "time.google.com"
+        help
+            Quaternary NTP server for time synchronization.
+
+    config SNTP_SYNC_RETRY_COUNT
+        int "SNTP Sync Retry Count"
+        default 30
+        help
+            Number of retries for SNTP synchronization before giving up.
+
+endmenu
