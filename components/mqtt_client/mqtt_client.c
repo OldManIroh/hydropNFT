@@ -623,21 +623,21 @@ void mqtt_client_publish_ota_status(const char *status)
 
 /**
  * @brief Публикация данных сенсоров в MQTT
- * 
+ *
  * Читает реальные значения напряжений с ADS1115 и публикует в топики:
  * - hydro/sensor/ph/state - Напряжение pH датчика (канал 0), В
- * - hydro/sensor/tds/state - Напряжение TDS датчика (канал 2), В
+ * - hydro/sensor/tds/state - TDS значение (канал 2), ppm
  * - hydro/sensor/level/state - Напряжение датчика уровня (канал 3), В
  * - hydro/sensor/water_temp/state - Напряжение датчика температуры воды (канал 1), В
- * 
+ *
  * Каналы ADS1115:
  * - 0: pH датчик
  * - 1: Температура воды
  * - 2: TDS датчик
  * - 3: Уровень воды
- * 
+ *
  * @note Вызывается периодически из mqtt_sensor_task() в main.c
- * @note Публикуются значения напряжений в вольтах (без калибровки)
+ * @note TDS датчик преобразуется из напряжения в ppm (0-2.3В = 0-1000 ppm)
  */
 void mqtt_client_publish_sensor_data(void)
 {
@@ -652,8 +652,12 @@ void mqtt_client_publish_sensor_data(void)
             snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[0]);
             esp_mqtt_client_publish(mqtt_client, "hydro/sensor/ph/state", msg, 0, 0, 0);
 
-            // Публикация напряжения TDS датчика (канал 2)
-            snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[2]);
+            // Публикация TDS датчика (канал 2) - преобразование из напряжения в ppm
+            // 0-2.3В = 0-1000 ppm
+            float tds_ppm = (sensor_data->voltage[2] / 2.3f) * 1000.0f;
+            if (tds_ppm < 0.0f) tds_ppm = 0.0f;
+            if (tds_ppm > 1000.0f) tds_ppm = 1000.0f;
+            snprintf(msg, sizeof(msg), "%.0f", tds_ppm);
             esp_mqtt_client_publish(mqtt_client, "hydro/sensor/tds/state", msg, 0, 0, 0);
 
             // Публикация напряжения датчика уровня воды (канал 3)
@@ -752,3 +756,11 @@ void mqtt_client_publish_time(const char *time_str)
     }
 }
 */
+
+/**
+ * @brief Получить дескриптор MQTT клиента
+ */
+void *mqtt_client_get_handle(void)
+{
+    return mqtt_client;
+}

@@ -58,12 +58,11 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "ads1115.h"
-// #include "touch_sens_example_config.h"  // Неиспользуемый заголовок
-// #include "water_level_capacitance.h"  // Временно отключен
 #include "dht.h"
 #include "ota_client.h"
 #include "hydro_mqtt_client.h"
 #include "sntp_client.h"
+#include "log_forwarder.h"
 #include "main.h"
 
 #ifndef APP_CPU_NUM
@@ -390,7 +389,7 @@ void ads1115_task(void *pvParameters)
         }
 
         // Ожидание 500 мс перед следующим измерением
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -588,56 +587,6 @@ void light_schedule_task(void *pvParameters)
     }
 }
 
-// ============================================================================
-// ЗАДАЧА ПУБЛИКАЦИИ ВРЕМЕНИ В MQTT - ОТКЛЮЧЕНА
-// ============================================================================
-// Эта задача больше не используется - время синхронизируется через SNTP,
-// но не публикуется в MQTT.
-//
-// /**
-//  * @brief Задача для публикации текущего времени в MQTT
-//  *
-//  * Периодически публикует текущее синхронизированное время
-//  * в топик hydro/system/time для отображения в Home Assistant.
-//  *
-//  * Процесс работы:
-//  * 1. Проверка подключения к MQTT
-//  * 2. Проверка синхронизации SNTP
-//  * 3. Получение строки времени
-//  * 4. Публикация в MQTT топик
-//  * 5. Пауза 10 секунд
-//  *
-//  * @param pvParameters Параметры задачи (не используются)
-//  *
-//  * @note Задача работает на ядре 0 (PRO_CPU) - сетевой стек
-//  * @note Приоритет: 3 (ниже среднего)
-//  * @note Размер стека: configMINIMAL_STACK_SIZE * 3 = 768 байт
-//  * @note Интервал публикации: 10 секунд
-//  *
-//  * @see sntp_client_is_synced()
-//  * @see sntp_client_get_time_string()
-//  */
-/*
-void mqtt_time_publish_task(void *pvParameters)
-{
-    char time_str[32];  // Буфер для строки времени
-
-    while (1) {
-        // Публикуем только при подключении к MQTT и синхронизированном времени
-        if (mqtt_client_is_connected() && sntp_client_is_synced()) {
-            // Получаем текущее время в формате "YYYY-MM-DD HH:MM:SS"
-            if (sntp_client_get_time_string(time_str, sizeof(time_str))) {
-                // Публикуем в MQTT топик hydro/system/time
-                mqtt_client_publish_time(time_str);
-                ESP_LOGI(TAG, "Опубликовано время: %s", time_str);
-            }
-        }
-
-        // Пауза 10 секунд перед следующей публикацией
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
-}
-*/
 
 // ============================================================================
 // ЗАДАЧА ПУБЛИКАЦИИ ПРОГРЕССА OTA В MQTT
@@ -876,6 +825,18 @@ void app_main(void)
     mqtt_client_init();
 
     // ==========================================================================
+    // 4.1. ИНИЦИАЛИЗАЦИЯ ПЕРЕСЫЛКИ ЛОГОВ В MQTT
+    // ==========================================================================
+
+    /*
+     * Инициализирует компонент log_forwarder для перехвата WARNING и ERROR
+     * логов и отправки их в MQTT топик hydro/log для Home Assistant.
+     *
+     * Вызывается ПОСЛЕ mqtt_client_init() т.к. использует MQTT подключение.
+     */
+    log_forwarder_init();
+
+    // ==========================================================================
     // 5. ИНИЦИАЛИЗАЦИЯ SNTP КЛИЕНТА
     // ==========================================================================
 
@@ -996,20 +957,8 @@ void app_main(void)
     //     PRO_CPU_NUM
     // );
 
-    // Задача публикации времени в MQTT ОТКЛЮЧЕНА
-    // Время синхронизируется через SNTP, но не публикуется в MQTT
-    // xTaskCreatePinnedToCore(
-    //     mqtt_time_publish_task,
-    //     "mqtt_time_publish_task",
-    //     configMINIMAL_STACK_SIZE * 3,
-    //     NULL,
-    //     3,
-    //     NULL,
-    //     PRO_CPU_NUM
-    // );
-
     ESP_LOGI(TAG, "Приложение запущено. Ожидание команд MQTT...");
-    ESP_LOGI(TAG, "SNTP инициализирован. Время синхронизируется, но не публикуется в MQTT");
+    ESP_LOGI(TAG, "SNTP инициализирован. Время синхронизируется");
     ESP_LOGI(TAG, "Задачи распределены: ADS1115 - ядро 1, MQTT/OTA/SNTP - ядро 0");
 
     // Управление передаётся планировщику FreeRTOS

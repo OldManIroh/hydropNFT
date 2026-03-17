@@ -214,13 +214,25 @@ void mqtt_client_publish_ota_progress(int progress, int downloaded, int total);
 
 /**
  * @brief Публикация версии прошивки в MQTT
- * 
+ *
  * @param version Строка версии прошивки
- * 
+ *
  * @note Топик: hydro/firmware/version
  * @note Пример: "0.2"
  */
 void mqtt_client_publish_firmware_version(const char *version);
+
+/**
+ * @brief Получить дескриптор MQTT клиента
+ *
+ * Используется внутренними компонентами для прямой публикации
+ * в MQTT (например, log_forwarder).
+ *
+ * @return Дескриптор MQTT клиента
+ *
+ * @note Используйте с осторожностью - только для внутренней публикации
+ */
+void *mqtt_client_get_handle(void);
 
 #ifdef __cplusplus
 }
