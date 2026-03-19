@@ -35,6 +35,9 @@
 /// Тег для системы логирования ESP-IDF
 static const char *TAG = "mqtt_client";
 
+/// Максимальное напряжение TDS датчика при 1000 ppm
+static const float TDS_MAX_VOLTAGE_V = 2.3f;
+
 /// Дескриптор MQTT клиента - используется для всех операций с MQTT
 static esp_mqtt_client_handle_t mqtt_client;
 
@@ -177,16 +180,16 @@ static void send_discovery_switch(esp_mqtt_client_handle_t client, const char *o
 
 /**
  * @brief Отправка конфигурации кнопки для Home Assistant Discovery
- * 
+ *
  * Кнопки используются для одноразовых действий (например, запуск OTA).
  * В отличие от switch, кнопки не имеют состояния - только команда.
- * 
+ *
  * @param client Дескриптор MQTT клиента
  * @param object_id Уникальный идентификатор (например: "ota_update")
  * @param name Отображаемое имя в HA
  * @param command_topic Топик для получения команд
  * @param payload Значение, отправляемое при нажатии кнопки
- * 
+ *
  * @note Кнопки не имеют state_topic - только command_topic
  */
 static void send_discovery_button(esp_mqtt_client_handle_t client, const char *object_id,
@@ -197,7 +200,7 @@ static void send_discovery_button(esp_mqtt_client_handle_t client, const char *o
 
     // Топик конфигурации кнопки
     snprintf(topic, sizeof(topic), "homeassistant/button/hydroesp32/%s/config", object_id);
-    
+
     // JSON конфигурации кнопки
     snprintf(payload_json, sizeof(payload_json),
              "{\"name\":\"%s\","
@@ -214,6 +217,7 @@ static void send_discovery_button(esp_mqtt_client_handle_t client, const char *o
              "}}",
              name, command_topic, payload, object_id);
 
+    // WDT-1: esp_mqtt_client_publish может блокироваться - не используем в критичных местах
     int msg_id = esp_mqtt_client_publish(client, topic, payload_json, 0, 1, 1);
     ESP_LOGI(TAG, "Button discovery sent for %s, msg_id=%d", object_id, msg_id);
 }
@@ -412,7 +416,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             publish_switch_state("hydro/switch/pump/state", pump_state);
             publish_switch_state("hydro/switch/light/state", light_state);
             publish_switch_state("hydro/switch/valve/state", valve_state);
-            
+
             // Публикуем статус OTA
             mqtt_client_publish_ota_status("idle");
 
@@ -457,18 +461,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             if (strcmp(topic, "hydro/switch/pump/set") == 0) {
                 if (strcmp(data, "ON") == 0) {
                     pump_state = true;
-                    ESP_LOGI(TAG, "Pump: ON");
-                    // Включаем насос через GPIO
-                    set_pump_state(true);
+                    ESP_LOGI(TAG, "Pump: ON (ручное управление)");
+                    // Включаем насос через GPIO (ручное управление на 5 минут)
+                    set_pump_state(true, true);
                 } else if (strcmp(data, "OFF") == 0) {
                     pump_state = false;
-                    ESP_LOGI(TAG, "Pump: OFF");
-                    set_pump_state(false);
+                    ESP_LOGI(TAG, "Pump: OFF (ручное управление)");
+                    set_pump_state(false, true);
                 }
                 // Отправляем подтверждение состояния обратно в HA
                 publish_switch_state("hydro/switch/pump/state", pump_state);
             }
-            
+
             // -------------------------------------------------------------
             // Обработка команды для света
             // Топик: hydro/switch/light/set
@@ -495,12 +499,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             else if (strcmp(topic, "hydro/switch/valve/set") == 0) {
                 if (strcmp(data, "ON") == 0) {
                     valve_state = true;
-                    ESP_LOGI(TAG, "Valve: ON");
-                    set_valve_state(true);  // Открываем клапан
+                    ESP_LOGI(TAG, "Valve: ON (ручное управление)");
+                    set_valve_state(true, true);  // Открываем клапан (ручное управление на 5 минут)
                 } else if (strcmp(data, "OFF") == 0) {
                     valve_state = false;
-                    ESP_LOGI(TAG, "Valve: OFF");
-                    set_valve_state(false);  // Закрываем клапан
+                    ESP_LOGI(TAG, "Valve: OFF (ручное управление)");
+                    set_valve_state(false, true);  // Закрываем клапан (ручное управление на 5 минут)
                 }
                 publish_switch_state("hydro/switch/valve/state", valve_state);
             }
@@ -520,6 +524,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             break;
         }
 
+        // ================================================================
+        // СОБЫТИЕ: ОШИБКА MQTT
+        // ================================================================
+        // ПОТ-15: Добавлена обработка ошибок для улучшения диагностики
+        case MQTT_EVENT_ERROR:
+            if (event->error_handle != NULL) {
+                ESP_LOGE(TAG, "MQTT error: type=%d, code=%d", 
+                        event->error_handle->error_type, 
+                        event->error_handle->connect_return_code);
+            } else {
+                ESP_LOGE(TAG, "MQTT error: unknown");
+            }
+            break;
+
         // Остальные события игнорируем
         default:
             break;
@@ -532,15 +550,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 /**
  * @brief Инициализация и запуск MQTT клиента
- * 
+ *
  * Создаёт MQTT клиента, регистрирует обработчик событий и подключается к брокеру.
  * Вызывается один раз в app_main().
- * 
- * Конфигурация подключения:
- * - Broker URI: mqtt://192.168.0.107:1883
- * - Username: hydroesp32
- * - Password: asda
- * 
+ *
+ * Конфигурация подключения (через menuconfig):
+ * - Broker URI: CONFIG_MQTT_BROKER_URI
+ * - Username: CONFIG_MQTT_USERNAME
+ * - Password: CONFIG_MQTT_PASSWORD
+ *
  * @note Функция не блокирующая - подключение происходит в фоне
  * @note Проверка mqtt_client_is_connected() покажет результат подключения
  */
@@ -548,11 +566,11 @@ void mqtt_client_init(void)
 {
     ESP_LOGI(TAG, "Initializing MQTT client");
 
-    // Конфигурация MQTT клиента
+    // Конфигурация MQTT клиента (учётные данные из Kconfig)
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://192.168.0.107:1883",  // Адрес брокера
-        .credentials.username = "hydroesp32",               // Имя пользователя
-        .credentials.authentication.password = "asda",      // Пароль
+        .broker.address.uri = CONFIG_MQTT_BROKER_URI,           // Адрес брокера из menuconfig
+        .credentials.username = CONFIG_MQTT_USERNAME,           // Имя пользователя из menuconfig
+        .credentials.authentication.password = CONFIG_MQTT_PASSWORD,  // Пароль из menuconfig
     };
 
     // Инициализация клиента
@@ -653,8 +671,8 @@ void mqtt_client_publish_sensor_data(void)
             esp_mqtt_client_publish(mqtt_client, "hydro/sensor/ph/state", msg, 0, 0, 0);
 
             // Публикация TDS датчика (канал 2) - преобразование из напряжения в ppm
-            // 0-2.3В = 0-1000 ppm
-            float tds_ppm = (sensor_data->voltage[2] / 2.3f) * 1000.0f;
+            // 0-TDS_MAX_VOLTAGE_V = 0-1000 ppm
+            float tds_ppm = (sensor_data->voltage[2] / TDS_MAX_VOLTAGE_V) * 1000.0f;
             if (tds_ppm < 0.0f) tds_ppm = 0.0f;
             if (tds_ppm > 1000.0f) tds_ppm = 1000.0f;
             snprintf(msg, sizeof(msg), "%.0f", tds_ppm);
@@ -670,14 +688,15 @@ void mqtt_client_publish_sensor_data(void)
         }
 
         // Публикация данных DHT (температура и влажность)
-        float temp = get_dht_temperature();
-        float hum = get_dht_humidity();
-        
-        if (temp != 0.0f || hum != 0.0f) {
+        // ЛОГ-3: Используем флаг валидности вместо проверки на 0.0
+        if (is_dht_data_valid()) {
+            float temp = get_dht_temperature();
+            float hum = get_dht_humidity();
+
             // Температура
             snprintf(msg, sizeof(msg), "%.1f", temp);
             esp_mqtt_client_publish(mqtt_client, "hydro/sensor/temperature/state", msg, 0, 0, 0);
-            
+
             // Влажность
             snprintf(msg, sizeof(msg), "%.1f", hum);
             esp_mqtt_client_publish(mqtt_client, "hydro/sensor/humidity/state", msg, 0, 0, 0);

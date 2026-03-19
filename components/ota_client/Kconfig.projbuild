@@ -14,9 +14,14 @@ config EXAMPLE_OTA_RECV_TIMEOUT
 
 config EXAMPLE_GPIO_DIAGNOSTIC
     int "GPIO for Diagnostic"
-    default 0
+    default 34
     help
-        GPIO пин для диагностики после OTA
+        GPIO пин для диагностики после OTA.
+
+        WARNING: Не используйте GPIO 0 (BOOT кнопка) или GPIO 2 (встроенный LED).
+        Рекомендуется использовать GPIO 34, 35, 36, 39 (только вход, нет подтяжек).
+
+        По умолчанию GPIO 34 - вход без подтяжки, конфликт с BOOT исключён.
 
 config EXAMPLE_CONNECT_WIFI
     bool "Connect using Wi-Fi"

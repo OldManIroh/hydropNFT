@@ -19,21 +19,23 @@ SemaphoreHandle_t get_ads1115_running_sem(void);
 /**
  * @brief Установить состояние насоса
  * @param state Состояние: true = включить, false = выключить
+ * @param manual Ручное управление: true = ручное (из MQTT, 5 мин), false = авто
  */
-void set_pump_state(bool state);
+void set_pump_state(bool state, bool manual);
 
 /**
  * @brief Установить состояние света
  * @param state Состояние: true = включить, false = выключить
- * @param manual Ручное управление: true = ручное (из MQTT), false = авто (расписание)
+ * @param manual Ручное управление: true = ручное (из MQTT, 2 часа), false = авто (расписание)
  */
 void set_light_state(bool state, bool manual);
 
 /**
  * @brief Установить состояние клапана
  * @param state Состояние: true = открыть, false = закрыть
+ * @param manual Ручное управление: true = ручное (из MQTT, 5 мин), false = авто
  */
-void set_valve_state(bool state);
+void set_valve_state(bool state, bool manual);
 
 /**
  * @brief Получить состояние насоса
@@ -64,6 +66,13 @@ float get_dht_temperature(void);
  * @return Влажность в %
  */
 float get_dht_humidity(void);
+
+/**
+ * @brief Проверить валидность данных DHT (ЛОГ-3)
+ * @return true если данные были успешно получены хотя бы раз
+ * @return false если данные ещё не получены
+ */
+bool is_dht_data_valid(void);
 
 #ifdef __cplusplus
 }

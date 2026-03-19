@@ -1,5 +1,26 @@
 menu "Example Configuration"
 
+    config MQTT_BROKER_URI
+        string "MQTT Broker URI"
+        default "mqtt://192.168.0.107:1883"
+        help
+            URI of the MQTT broker to connect to.
+            Example: mqtt://192.168.0.107:1883 or mqtts://broker.example.com:8883
+
+    config MQTT_USERNAME
+        string "MQTT Username"
+        default "hydroesp32"
+        help
+            Username for MQTT authentication.
+
+    config MQTT_PASSWORD
+        string "MQTT Password"
+        default "asda"
+        help
+            Password for MQTT authentication.
+            WARNING: This is stored in plain text in the configuration.
+            For production use, consider using NVS-based secure storage.
+
     config BROKER_URL
         string "Broker URL"
         default "mqtt://mqtt.eclipseprojects.io"

@@ -1,3 +1,26 @@
+/**
+ * @file ads1115.c
+ * @brief Драйвер ADS1115 для HydroNFT
+ *
+ * Компонент для работы с 4-канальным 16-битным АЦП ADS1115 через I2C.
+ * Используется для чтения аналоговых датчиков:
+ * - Канал 0: pH метр
+ * - Канал 1: Температура воды
+ * - Канал 2: TDS метр
+ * - Канал 3: Уровень воды
+ *
+ * Особенности реализации:
+ * - Мьютекс для защиты от одновременного доступа (КРИТ-3)
+ * - Медианный фильтр (окно 5 отсчётов) для подавления шумов
+ * - Обработка таймаутов I2C (ПОТ-2, ПОТ-3)
+ * - Раздельное чтение voltage и raw_value (ЛОГ-1)
+ * - Маска валидных каналов (ЛОГ-5)
+ *
+ * @author HydroNFT Team
+ * @version 2.0
+ * @date 2024
+ */
+
 #include <stdio.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -10,54 +33,57 @@
 #include "driver/i2c.h"
 
 #define I2C_PORT 0
-#define GAIN ADS111X_GAIN_4V096 // +-4.096V
+#define GAIN ADS111X_GAIN_4V096  ///< Коэффициент усиления: ±4.096В
 
 static const char *TAG = "ADS1115";
 
-// Адрес I2C
+/// Адрес I2C (зависит от подключения ADDR: GND=0x48, VDD=0x49, SDA=0x4A, SCL=0x4B)
 static const uint8_t addr = ADS111X_ADDR_GND;
 
-// Дескрипторы
+/// Дескриптор устройства I2C
 static i2c_dev_t device;
 
-// Значение усиления
+/// Значение усиления в вольтах (из таблицы ads111x_gain_values)
 static float gain_val;
 
-// Флаг инициализации
+/// Флаг инициализации (защита от повторной инициализации)
 static bool ads1115_initialized = false;
 
-// Мьютекс для защиты доступа к ADS1115 (пункт 1.2)
+/// Мьютекс для защиты доступа к I2C шине (КРИТ-3)
 static SemaphoreHandle_t ads1115_mutex = NULL;
 
-// Конфигурация фильтра (пункт 1.3)
+/// Размер окна медианного фильтра (нечётное число для корректной медианы)
 #define ADS1115_FILTER_WINDOW_SIZE 5
 
-// Состояние медианного фильтра
+/// Состояние медианного фильтра для всех 4 каналов
 typedef struct {
-    float voltage_buffer[4][ADS1115_FILTER_WINDOW_SIZE];
-    int16_t raw_buffer[4][ADS1115_FILTER_WINDOW_SIZE];
-    uint8_t buffer_index;
-    bool buffer_filled;
+    float voltage_buffer[4][ADS1115_FILTER_WINDOW_SIZE];  ///< Буфер напряжений
+    int16_t raw_buffer[4][ADS1115_FILTER_WINDOW_SIZE];    ///< Буфер raw-значений
+    uint8_t buffer_index;                                  ///< Текущий индекс (циклический)
+    bool buffer_filled;                                    ///< Флаг заполнения буфера
 } ads1115_filter_state_t;
 
 static ads1115_filter_state_t filter_state = {0};
 
-// Последние данные сенсоров для доступа из других компонентов (ЛОГ-1)
+/// Последние данные сенсоров для доступа из других компонентов (ЛОГ-1, ЛОГ-5)
 static ads1115_sensor_data_t latest_sensor_data = {0};
 
-// Таймауты для операций I2C (пункт 1.1)
-#define ADS1115_I2C_TIMEOUT_MS 100
-#define ADS1115_CONVERSION_TIMEOUT_MS 150
+/// Таймаут ожидания конвертации (ПОТ-2: 250 мс для 8 SPS с запасом 2×)
+#define ADS1115_CONVERSION_TIMEOUT_MS 250
 
-// Массив настроек мультиплексора для всех 4 каналов
+/// Таймаут захвата мьютекса (ПОТ-3: 200 мс > времени удержания 125+ мс)
+#define ADS1115_I2C_TIMEOUT_MS 200
+
+/// Настройки мультиплексора для каналов 0-3 (каждый канал к GND)
 static const ads111x_mux_t mux_settings[4] = {
-    ADS111X_MUX_0_GND,
-    ADS111X_MUX_1_GND,
-    ADS111X_MUX_2_GND,
-    ADS111X_MUX_3_GND};
+    ADS111X_MUX_0_GND,  ///< Канал 0: AIN0 к GND
+    ADS111X_MUX_1_GND,  ///< Канал 1: AIN1 к GND
+    ADS111X_MUX_2_GND,  ///< Канал 2: AIN2 к GND
+    ADS111X_MUX_3_GND   ///< Канал 3: AIN3 к GND
+};
 
 // ============================================================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (медианный фильтр - пункт 1.3)
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (медианный фильтр)
 // ============================================================================
 
 /**
@@ -65,12 +91,15 @@ static const ads111x_mux_t mux_settings[4] = {
  * @param buffer Буфер с данными
  * @param size Размер буфера
  * @return Медианное значение
+ *
+ * @note Использует сортировку пузырьком — эффективно для малых размеров (≤5)
+ * @note Возвращает средний элемент отсортированного массива
  */
 static float median_filter_float(const float *buffer, uint8_t size)
 {
     float sorted[ADS1115_FILTER_WINDOW_SIZE];
     memcpy(sorted, buffer, size * sizeof(float));
-    
+
     // Сортировка пузырьком для малого размера
     for (int i = 0; i < size - 1; i++) {
         for (int j = 0; j < size - i - 1; j++) {
@@ -81,7 +110,7 @@ static float median_filter_float(const float *buffer, uint8_t size)
             }
         }
     }
-    
+
     return sorted[size / 2];  // Возвращаем медиану
 }
 
@@ -90,12 +119,15 @@ static float median_filter_float(const float *buffer, uint8_t size)
  * @param buffer Буфер с данными
  * @param size Размер буфера
  * @return Медианное значение
+ *
+ * @note Использует сортировку пузырьком — эффективно для малых размеров (≤5)
+ * @note Возвращает средний элемент отсортированного массива
  */
 static int16_t median_filter_int16(const int16_t *buffer, uint8_t size)
 {
     int16_t sorted[ADS1115_FILTER_WINDOW_SIZE];
     memcpy(sorted, buffer, size * sizeof(int16_t));
-    
+
     // Сортировка пузырьком для малого размера
     for (int i = 0; i < size - 1; i++) {
         for (int j = 0; j < size - i - 1; j++) {
@@ -106,10 +138,24 @@ static int16_t median_filter_int16(const int16_t *buffer, uint8_t size)
             }
         }
     }
-    
+
     return sorted[size / 2];  // Возвращаем медиану
 }
 
+/**
+ * @brief Инициализация ADS1115
+ * @return ESP_OK при успехе, код ошибки в противном случае
+ *
+ * Последовательность инициализации:
+ * 1. Создание мьютекса для защиты I2C шины
+ * 2. Инициализация I2C библиотеки (i2cdev)
+ * 3. Настройка дескриптора устройства
+ * 4. Конфигурация ADS1115: режим, скорость, усиление
+ *
+ * @note Вызывается один раз в app_main() перед запуском задач
+ * @note Повторный вызов возвращает ESP_OK (защита от дублирования)
+ * @note При ошибке инициализации используйте ads1115_reset() для сброса
+ */
 esp_err_t ads1115_init(void)
 {
     // Проверяем, не была ли уже инициализирована
@@ -118,7 +164,7 @@ esp_err_t ads1115_init(void)
         return ESP_OK;
     }
 
-    // Создаём мьютекс для защиты доступа (пункт 1.2)
+    // Создаём мьютекс для защиты доступа (КРИТ-3)
     if (ads1115_mutex == NULL) {
         ads1115_mutex = xSemaphoreCreateMutex();
         if (ads1115_mutex == NULL) {
@@ -128,7 +174,7 @@ esp_err_t ads1115_init(void)
         ESP_LOGI(TAG, "Мьютекс ADS1115 создан");
     }
 
-    // Инициализация библиотеки
+    // Инициализация библиотеки I2C
     esp_err_t res = i2cdev_init();
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Ошибка инициализации I2C библиотеки: %d", res);
@@ -148,13 +194,13 @@ esp_err_t ads1115_init(void)
     gain_val = ads111x_gain_values[GAIN];
 
     // Настройка ADS1115
-    res = ads111x_set_mode(&device, ADS111X_MODE_SINGLE_SHOT);   // Режим одиночного измерения
+    res = ads111x_set_mode(&device, ADS111X_MODE_SINGLE_SHOT);   ///< Режим одиночного измерения
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Ошибка установки режима ADS1115: %d", res);
         return res;
     }
 
-    res = ads111x_set_data_rate(&device, ADS111X_DATA_RATE_8); // 32 выборки в секунду
+    res = ads111x_set_data_rate(&device, ADS111X_DATA_RATE_8); ///< 8 выборок в секунду (период 125 мс)
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Ошибка установки частоты дискретизации ADS1115: %d", res);
         return res;
@@ -176,10 +222,17 @@ esp_err_t ads1115_init(void)
  * @param channel Номер канала (0-3)
  * @param voltage Указатель для хранения значения напряжения
  * @return ESP_OK при успехе, код ошибки в противном случае
- * 
- * @note Пункт 1.1: Добавлена обработка ошибок I2C и таймауты
- * @note Пункт 1.2: Добавлена защита мьютексом
- * @note Пункт 2.2: Исправлен расчёт напряжения (переполнение)
+ *
+ * Выполняет полный цикл измерения:
+ * 1. Установка мультиплексора на нужный канал
+ * 2. Запуск конвертации
+ * 3. Ожидание завершения (с таймаутом)
+ * 4. Чтение результата
+ * 5. Преобразование в напряжение
+ *
+ * @note Функция захватывает мьютекс на время всего измерения (до 250 мс)
+ * @note ПОТ-2: Таймаут 250 мс выбран с запасом 2× для 8 SPS (период 125 мс)
+ * @note ПОТ-3: Таймаут мьютекса 200 мс > времени удержания
  */
 esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage)
 {
@@ -187,7 +240,7 @@ esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Захватываем мьютекс (пункт 1.2)
+    // Захватываем мьютекс (КРИТ-3)
     if (xSemaphoreTake(ads1115_mutex, pdMS_TO_TICKS(ADS1115_I2C_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "Не удалось захватить мьютекс ADS1115");
         return ESP_ERR_TIMEOUT;
@@ -199,7 +252,7 @@ esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage)
     // Установка входного мультиплексора для канала
     res = ads111x_set_input_mux(&device, mux_settings[channel]);
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка установки мультиплексора канала %u: %s", 
+        ESP_LOGE(TAG, "Ошибка установки мультиплексора канала %u: %s",
                  channel, esp_err_to_name(res));
         xSemaphoreGive(ads1115_mutex);
         return res;
@@ -208,27 +261,27 @@ esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage)
     // Запуск преобразования
     res = ads111x_start_conversion(&device);
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка запуска конвертации канала %u: %s", 
+        ESP_LOGE(TAG, "Ошибка запуска конвертации канала %u: %s",
                  channel, esp_err_to_name(res));
         xSemaphoreGive(ads1115_mutex);
         return res;
     }
 
-    // Ожидание завершения преобразования с таймаутом (пункт 1.1)
+    // Ожидание завершения преобразования с таймаутом
     bool busy;
     TickType_t start_tick = xTaskGetTickCount();
     const TickType_t timeout_ticks = pdMS_TO_TICKS(ADS1115_CONVERSION_TIMEOUT_MS);
-    
+
     do {
         vTaskDelay(pdMS_TO_TICKS(1));
         res = ads111x_is_busy(&device, &busy);
         if (res != ESP_OK) {
-            ESP_LOGE(TAG, "Ошибка проверки статуса канала %u: %s", 
+            ESP_LOGE(TAG, "Ошибка проверки статуса канала %u: %s",
                      channel, esp_err_to_name(res));
             xSemaphoreGive(ads1115_mutex);
             return res;
         }
-        
+
         // Проверка таймаута
         if (xTaskGetTickCount() - start_tick > timeout_ticks) {
             ESP_LOGE(TAG, "Таймаут ожидания конвертации канала %u", channel);
@@ -240,7 +293,7 @@ esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage)
     // Чтение результата
     res = ads111x_get_value(&device, &raw);
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка чтения значения канала %u: %s", 
+        ESP_LOGE(TAG, "Ошибка чтения значения канала %u: %s",
                  channel, esp_err_to_name(res));
         xSemaphoreGive(ads1115_mutex);
         return res;
@@ -249,9 +302,10 @@ esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage)
     // Освобождаем мьютекс
     xSemaphoreGive(ads1115_mutex);
 
-    // Расчёт напряжения (пункт 2.2 - исправлено переполнение)
+    // Расчёт напряжения: V = (gain × raw) / MAX_VALUE
+    // gain_val = 4.096В, ADS111X_MAX_VALUE = 32767 (2^15-1)
     *voltage = (gain_val * (float)raw) / (float)ADS111X_MAX_VALUE;
-    
+
     return ESP_OK;
 }
 
@@ -260,9 +314,16 @@ esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage)
  * @param channel Номер канала (0-3)
  * @param raw_value Указатель для хранения сырых ADC значений
  * @return ESP_OK при успехе, код ошибки в противном случае
- * 
- * @note Пункт 1.1: Добавлена обработка ошибок I2C и таймауты
- * @note Пункт 1.2: Добавлена защита мьютексом
+ *
+ * Выполняет полный цикл измерения:
+ * 1. Установка мультиплексора на нужный канал
+ * 2. Запуск конвертации
+ * 3. Ожидание завершения (с таймаутом)
+ * 4. Чтение raw-значения (без преобразования в напряжение)
+ *
+ * @note Функция захватывает мьютекс на время всего измерения (до 250 мс)
+ * @note Используется в паре с ads1115_read_voltage() для ЛОГ-1
+ * @note ПОТ-2: Таймаут 250 мс выбран с запасом 2× для 8 SPS (период 125 мс)
  */
 esp_err_t ads1115_read_raw(uint8_t channel, int16_t *raw_value)
 {
@@ -270,7 +331,7 @@ esp_err_t ads1115_read_raw(uint8_t channel, int16_t *raw_value)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Захватываем мьютекс (пункт 1.2)
+    // Захватываем мьютекс (КРИТ-3)
     if (xSemaphoreTake(ads1115_mutex, pdMS_TO_TICKS(ADS1115_I2C_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "Не удалось захватить мьютекс ADS1115");
         return ESP_ERR_TIMEOUT;
@@ -281,7 +342,7 @@ esp_err_t ads1115_read_raw(uint8_t channel, int16_t *raw_value)
     // Установка входного мультиплексора для канала
     res = ads111x_set_input_mux(&device, mux_settings[channel]);
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка установки мультиплексора канала %u: %s", 
+        ESP_LOGE(TAG, "Ошибка установки мультиплексора канала %u: %s",
                  channel, esp_err_to_name(res));
         xSemaphoreGive(ads1115_mutex);
         return res;
@@ -290,27 +351,27 @@ esp_err_t ads1115_read_raw(uint8_t channel, int16_t *raw_value)
     // Запуск преобразования
     res = ads111x_start_conversion(&device);
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка запуска конвертации канала %u: %s", 
+        ESP_LOGE(TAG, "Ошибка запуска конвертации канала %u: %s",
                  channel, esp_err_to_name(res));
         xSemaphoreGive(ads1115_mutex);
         return res;
     }
 
-    // Ожидание завершения преобразования с таймаутом (пункт 1.1)
+    // Ожидание завершения преобразования с таймаутом
     bool busy;
     TickType_t start_tick = xTaskGetTickCount();
     const TickType_t timeout_ticks = pdMS_TO_TICKS(ADS1115_CONVERSION_TIMEOUT_MS);
-    
+
     do {
         vTaskDelay(pdMS_TO_TICKS(1));
         res = ads111x_is_busy(&device, &busy);
         if (res != ESP_OK) {
-            ESP_LOGE(TAG, "Ошибка проверки статуса канала %u: %s", 
+            ESP_LOGE(TAG, "Ошибка проверки статуса канала %u: %s",
                      channel, esp_err_to_name(res));
             xSemaphoreGive(ads1115_mutex);
             return res;
         }
-        
+
         // Проверка таймаута
         if (xTaskGetTickCount() - start_tick > timeout_ticks) {
             ESP_LOGE(TAG, "Таймаут ожидания конвертации канала %u", channel);
@@ -322,13 +383,13 @@ esp_err_t ads1115_read_raw(uint8_t channel, int16_t *raw_value)
     // Чтение результата
     res = ads111x_get_value(&device, raw_value);
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка чтения значения канала %u: %s", 
+        ESP_LOGE(TAG, "Ошибка чтения значения канала %u: %s",
                  channel, esp_err_to_name(res));
     }
 
     // Освобождаем мьютекс
     xSemaphoreGive(ads1115_mutex);
-    
+
     return res;
 }
 
@@ -336,8 +397,17 @@ esp_err_t ads1115_read_raw(uint8_t channel, int16_t *raw_value)
  * @brief Измерение напряжения со всех каналов и возврат результатов
  * @param measurements Массив для хранения результатов измерений (должен быть размером не менее 4 элементов)
  * @return ESP_OK при успехе, код ошибки в противном случае
- * 
- * @note Пункт 1.3: Добавлен медианный фильтр для подавления шумов
+ *
+ * Измеряет все 4 канала ADS1115 последовательно:
+ * 1. Чтение напряжения (ads1115_read_voltage)
+ * 2. Чтение raw-значения (ads1115_read_raw) — ЛОГ-1
+ * 3. Применение медианного фильтра (если буфер заполнен)
+ * 4. Сохранение в структуру measurements
+ * 5. Обновление latest_sensor_data с маской валидных каналов — ЛОГ-5
+ *
+ * @note Функция НЕ захватывает мьютекс — он захватывается внутри read_voltage/read_raw
+ * @note Медианный фильтр начинает работать после первого полного цикла (5 измерений)
+ * @note При ошибке одного канала остальные продолжают работать (ЛОГ-5)
  */
 esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
 {
@@ -354,9 +424,19 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
         measurements[ch].raw_value = 0;
         measurements[ch].error = ESP_OK;
 
-        // КРИТ-1: ОДНО чтение напряжения на канал (вместо двух: voltage + raw)
+        // ЛОГ-1: Читаем напряжение И raw-значение ADC
         float voltage = 0.0f;
+        int16_t raw = 0;
         esp_err_t res = ads1115_read_voltage(ch, &voltage);
+
+        // Читаем raw-значение через отдельный вызов (ADS1115 хранит последнее значение)
+        if (res == ESP_OK) {
+            res = ads1115_read_raw(ch, &raw);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "Не удалось прочитать raw канала %u, используем 0", ch);
+                raw = 0;
+            }
+        }
 
         if (res != ESP_OK) {
             measurements[ch].error = res;
@@ -364,32 +444,40 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
             continue;
         }
 
-        // Добавляем в буфер фильтра (пункт 1.3)
+        measurements[ch].raw_value = raw;
+
+        // Добавляем в буфер фильтра
         filter_state.voltage_buffer[ch][filter_state.buffer_index] = voltage;
+        filter_state.raw_buffer[ch][filter_state.buffer_index] = raw;
 
         // Применяем медианный фильтр только если буфер заполнен хотя бы один раз
         if (filter_state.buffer_filled) {
             measurements[ch].voltage = median_filter_float(
                 filter_state.voltage_buffer[ch], ADS1115_FILTER_WINDOW_SIZE);
+            measurements[ch].raw_value = median_filter_int16(
+                filter_state.raw_buffer[ch], ADS1115_FILTER_WINDOW_SIZE);
         } else {
             measurements[ch].voltage = voltage;
         }
     }
 
-    // Циклический буфер
+    // Циклический буфер: индекс 0→1→2→3→4→0...
     filter_state.buffer_index = (filter_state.buffer_index + 1) % ADS1115_FILTER_WINDOW_SIZE;
     if (filter_state.buffer_index == 0) {
-        filter_state.buffer_filled = true;
+        filter_state.buffer_filled = true;  // Буфер заполнен хотя бы один раз
     }
 
     // ЛОГ-1: Обновляем последние данные для доступа из MQTT
+    // ЛОГ-5: Устанавливаем valid при частичном успехе + маска valid_channels
+    latest_sensor_data.valid = false;
+    latest_sensor_data.valid_channels = 0;
+
     for (size_t ch = 0; ch < 4; ch++) {
         if (measurements[ch].error == ESP_OK) {
             latest_sensor_data.voltage[ch] = measurements[ch].voltage;
+            latest_sensor_data.valid = true;
+            latest_sensor_data.valid_channels |= (1 << ch);  // Устанавливаем бит канала
         }
-    }
-    if (overall_result == ESP_OK) {
-        latest_sensor_data.valid = true;
     }
 
     return overall_result;
@@ -398,6 +486,15 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
 /**
  * @brief Получить последние измеренные данные с ADS1115
  * @return Указатель на структуру с данными (никогда не NULL)
+ *
+ * Возвращает указатель на статическую структуру latest_sensor_data,
+ * которая обновляется в функции ads1115_measure_all_channels().
+ *
+ * @note Данные обновляются в ads1115_task() каждые 1 секунду
+ * @note Поле valid_channels содержит битовую маску валидных каналов:
+ *       - бит 0 установлен = канал 0 валиден
+ *       - бит 1 установлен = канал 1 валиден, и т.д.
+ * @note Функция не требует мьютекса — чтение bool и float атомарно на ESP32
  */
 const ads1115_sensor_data_t* ads1115_get_latest_data(void)
 {
@@ -405,13 +502,20 @@ const ads1115_sensor_data_t* ads1115_get_latest_data(void)
 }
 
 /**
- * @brief Деинициализация I2C драйвера для освобождения шины
+ * @brief Деинициализация ADS1115 для OTA обновления
  *
  * Вызывается перед OTA обновлением для предотвращения конфликтов I2C.
- * После перезагрузки при успешном OTA инициализация произойдёт заново.
+ * Освобождает все ресурсы:
+ * 1. Удаляет мьютекс
+ * 2. Освобождает дескриптор устройства
+ * 3. Сбрасывает флаг инициализации
+ * 4. Очищает буферы фильтра
+ * 5. Освобождает ресурсы I2C библиотеки (i2cdev_done)
  *
- * @note Вызывать только перед OTA обновлением (когда версии НЕ совпали)
- * @note НЕ вызывать если OTA не требуется (версии совпали)
+ * @note Вызывать ТОЛЬКО перед OTA обновлением (когда версии НЕ совпали)
+ * @note НЕ вызывать если OTA не требуется (версии совпали) — см. ota_exit_no_update()
+ * @note После перезагрузки при успешном OTA инициализация произойдёт заново
+ * @note ПОТ-16: i2cdev_done() безопасен, т.к. ADS1115 — единственный I2C компонент
  */
 void ads1115_deinit(void)
 {
@@ -424,7 +528,7 @@ void ads1115_deinit(void)
         ESP_LOGI(TAG, "Мьютекс ADS1115 удалён");
     }
 
-    // Освобождаем ресурсы I2C устройства (ПОТ-8)
+    // Освобождаем ресурсы I2C устройства
     ads111x_free_desc(&device);
 
     // Сбрасываем флаг инициализации
@@ -436,8 +540,9 @@ void ads1115_deinit(void)
     // Сбрасываем состояние фильтра
     memset(&filter_state, 0, sizeof(filter_state));
 
-    // Освобождаем ресурсы I2C библиотеки (если другие компоненты не используют)
-    // i2cdev_done();  // Закомментировано - может использоваться другими компонентами
+    // ПОТ-16: Освобождаем ресурсы I2C библиотеки
+    // ADS1115 — единственный I2C-компонент в проекте, можно безопасно вызывать
+    i2cdev_done();
 
     ESP_LOGI(TAG, "ADS1115 деинициализирован");
 }
@@ -445,8 +550,16 @@ void ads1115_deinit(void)
 /**
  * @brief Сброс состояния ADS1115
  *
- * Полностью сбрасывает состояние компонента.
- * Используется при ошибках инициализации.
+ * Полностью сбрасывает состояние компонента:
+ * 1. Удаляет мьютекс
+ * 2. Сбрасывает флаг инициализации
+ * 3. Очищает дескриптор устройства
+ * 4. Сбрасывает буферы фильтра
+ *
+ * Используется при ошибках инициализации для возможности повторной инициализации.
+ *
+ * @note В отличие от ads1115_deinit(), НЕ вызывает i2cdev_done()
+ * @note После сброса необходимо вызвать ads1115_init() для повторной инициализации
  */
 void ads1115_reset(void)
 {
@@ -461,7 +574,7 @@ void ads1115_reset(void)
     ads1115_initialized = false;
     memset(&device, 0, sizeof(device));
     gain_val = 0.0f;
-    
+
     // Сбрасываем состояние фильтра
     memset(&filter_state, 0, sizeof(filter_state));
 

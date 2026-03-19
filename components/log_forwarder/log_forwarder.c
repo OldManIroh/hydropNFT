@@ -312,10 +312,11 @@ void log_forwarder_init(void)
 
     // Запускаем задачу для отправки MQTT Discovery конфигурации
     // (нужно дождаться подключения к MQTT)
+    // Стек: 3072 байт - ESP_LOGI, mqtt_client_publish, json буферы, запас 3×
     xTaskCreate(
         log_forwarder_discovery_task,
         "log_disc_task",
-        2048,
+        3072,  // ПОТ-11: увеличено с 2048 до 3072 байт (переполнение стека)
         NULL,
         2,  // Низкий приоритет
         NULL

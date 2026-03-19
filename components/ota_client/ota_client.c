@@ -25,7 +25,10 @@
 #include "hydro_mqtt_client.h"  // Для публикации статуса OTA и версии прошивки
 #include "esp_task_wdt.h"       // Для сброса watchdog (пункт 1.7)
 
-// Объявляем внешнюю функцию для доступа к семафору ADS1115
+// Объявляем внешние функции из main.c (компонент не может зависеть от main)
+extern void set_pump_state(bool state, bool manual);
+extern void set_light_state(bool state, bool manual);
+extern void set_valve_state(bool state, bool manual);
 extern SemaphoreHandle_t get_ads1115_running_sem(void);
 
 #if CONFIG_EXAMPLE_CONNECT_WIFI
@@ -115,7 +118,7 @@ static void ota_exit_no_update(esp_http_client_handle_t client, esp_ota_handle_t
     s_ota_downloaded_bytes = 0;
     s_ota_total_bytes = 0;
 
-    // Очищаем ресурсы и завершаем задачу
+    // Очищаем ресурсы
     if (update_handle > 0) {
         esp_ota_abort(update_handle);
     }
@@ -124,16 +127,11 @@ static void ota_exit_no_update(esp_http_client_handle_t client, esp_ota_handle_t
     // Публикуем статус что обновление не требуется
     mqtt_client_publish_ota_status("no_update");
 
-    // Пункт 1.8: Восстанавливаем семафор ADS1115 (т.к. OTA не состоялось)
-    // Задача была остановлена через семафор в mqtt_ota_check_task
-    SemaphoreHandle_t sem = get_ads1115_running_sem();
-    if (sem != NULL) {
-        ESP_LOGI(TAG, "Восстановление семафора ADS1115...");
-        xSemaphoreGive(sem);
-        ESP_LOGI(TAG, "Задача ADS1115 восстановлена");
-    }
+    // Удаляем задачу из TWDT перед удалением, чтобы WDT не ждал сброс от несуществующей задачи
+    esp_task_wdt_delete(NULL);
 
     // Завершаем задачу OTA - устройство продолжает работу
+    // Оборудование и ADS1115 НЕ были остановлены (версии совпали — ничего не трогали)
     vTaskDelete(NULL);
 }
 
@@ -144,7 +142,10 @@ static void ota_task(void *pvParameter)
     const esp_partition_t *update_partition = NULL;
 
     ESP_LOGI(TAG, "Запуск задачи OTA-обновления");
-    
+
+    // Добавляем эту задачу в TWDT для предотвращения перезагрузки по watchdog
+    esp_task_wdt_add(NULL);
+
     // Публикуем текущую версию прошивки
     esp_app_desc_t running_app_info;
     if (esp_ota_get_partition_description(esp_ota_get_running_partition(), &running_app_info) == ESP_OK) {
@@ -207,13 +208,21 @@ static void ota_task(void *pvParameter)
 
     int binary_file_length = 0;
     bool image_header_was_checked = false;
+    int last_progress = 0;  // КРИТ-6: локальная переменная для корректного сброса между сессиями OTA
 
     while (1) {
+        // Сброс watchdog в каждом цикле для предотвращения перезагрузки
+        esp_task_wdt_reset();
+
         int data_read = esp_http_client_read(client, ota_write_data, BUFFSIZE);
 
         if (data_read < 0) {
             ESP_LOGE(TAG, "Ошибка: ошибка чтения SSL данных");
             http_cleanup(client);
+            // КРИТ-4: Прерываем OTA перед перезагрузкой, чтобы не повредить flash
+            if (update_handle > 0) {
+                esp_ota_abort(update_handle);
+            }
             task_fatal_error();
         }
         else if (data_read > 0) {
@@ -253,6 +262,29 @@ static void ota_task(void *pvParameter)
 
                     image_header_was_checked = true;
 
+                    // ============================================================
+                    // Версии различаются — обновление будет выполнено!
+                    // Теперь безопасно остановить оборудование и ADS1115
+                    // ============================================================
+
+                    // БЕЗОПАСНОСТЬ: Отключаем насос, свет и клапан перед записью во flash
+                    ESP_LOGW(TAG, "БЕЗОПАСНОСТЬ: Отключение насоса, света и клапана перед OTA...");
+                    set_pump_state(false, false);
+                    set_light_state(false, false);
+                    set_valve_state(false, false);
+                    vTaskDelay(pdMS_TO_TICKS(100));  // Даём время на отключение реле
+
+                    // Корректная остановка ADS1115 через семафор
+                    SemaphoreHandle_t sem = get_ads1115_running_sem();
+                    if (sem != NULL) {
+                        if (xSemaphoreTake(sem, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                            ESP_LOGI(TAG, "ADS1115 остановлен корректно (семафор захвачен)");
+                            // НЕ возвращаем семафор — задача ADS1115 останется заблокированной
+                        } else {
+                            ESP_LOGW(TAG, "Таймаут остановки ADS1115 — продолжаем OTA");
+                        }
+                    }
+
                     err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
                     if (err != ESP_OK) {
                         ESP_LOGE(TAG, "Ошибка начала OTA (%s)", esp_err_to_name(err));
@@ -282,17 +314,10 @@ static void ota_task(void *pvParameter)
             // Выводим прогресс каждые 10%
             if (s_ota_total_bytes > 0) {
                 int progress = (binary_file_length * 100) / s_ota_total_bytes;
-                if (progress % 10 == 0 && progress > 0) {
-                    // ПОТ-11: Используем локальную переменную вместо static
-                    // чтобы прогресс корректно сбрасывался между сессиями OTA
-                    static int last_progress = 0;
-                    if (progress != last_progress) {
-                        // Пункт 1.7: Сброс watchdog для предотвращения перезагрузки
-                        esp_task_wdt_reset();
-                        ESP_LOGI(TAG, "Прогресс загрузки: %d%% (%d/%d байт)",
-                                progress, binary_file_length, s_ota_total_bytes);
-                        last_progress = progress;
-                    }
+                if (progress != last_progress) {
+                    ESP_LOGI(TAG, "Прогресс загрузки: %d%% (%d/%d байт)",
+                            progress, binary_file_length, s_ota_total_bytes);
+                    last_progress = progress;
                 }
             }
             ESP_LOGD(TAG, "Длина записанного образа %d", binary_file_length);
