@@ -360,7 +360,7 @@ void dht_task(void *pvParameters)
         }
 
         // Пауза 2 секунды (чаще читать не рекомендуется)
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
 
