@@ -316,7 +316,7 @@ void log_forwarder_init(void)
     xTaskCreate(
         log_forwarder_discovery_task,
         "log_disc_task",
-        3072,  // ПОТ-11: увеличено с 2048 до 3072 байт (переполнение стека)
+        3072,
         NULL,
         2,  // Низкий приоритет
         NULL

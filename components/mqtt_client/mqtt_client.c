@@ -527,7 +527,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // ================================================================
         // СОБЫТИЕ: ОШИБКА MQTT
         // ================================================================
-        // ПОТ-15: Добавлена обработка ошибок для улучшения диагностики
         case MQTT_EVENT_ERROR:
             if (event->error_handle != NULL) {
                 ESP_LOGE(TAG, "MQTT error: type=%d, code=%d", 
@@ -662,7 +661,6 @@ void mqtt_client_publish_sensor_data(void)
     if (mqtt_connected && mqtt_client) {
         char msg[64];  // Буфер для строкового представления значения
 
-        // ЛОГ-1: Получаем реальные данные с ADS1115 вместо заглушек
         const ads1115_sensor_data_t *sensor_data = ads1115_get_latest_data();
 
         if (sensor_data->valid) {
@@ -688,7 +686,6 @@ void mqtt_client_publish_sensor_data(void)
         }
 
         // Публикация данных DHT (температура и влажность)
-        // ЛОГ-3: Используем флаг валидности вместо проверки на 0.0
         if (is_dht_data_valid()) {
             float temp = get_dht_temperature();
             float hum = get_dht_humidity();

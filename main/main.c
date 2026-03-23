@@ -41,15 +41,15 @@
  * Задачи FreeRTOS:
  * | Задача                 | Приоритет | Стек (байты) | Ядро | Описание           |
  * |------------------------|-----------|--------------|------|--------------------|
- * | dht_task               | 3         | 2048         | 1    | Чтение DHT         |
- * | ads1115_task           | 3         | 4096         | 1    | Чтение ADS1115     |
- * | mqtt_sensor_task       | 4         | 2048         | 0    | Публикация сенсоров|
- * | mqtt_ota_check_task    | 4         | 3072         | 0    | Проверка OTA флага |
- * | mqtt_ota_progress_task | 4         | 2048         | 0    | Публикация OTA прогресса |
+ * | dht_task               | 3         | 4096         | 1    | Чтение DHT         |
+ * | ads1115_task           | 4         | 4096         | 1    | Чтение ADS1115     |
+ * | mqtt_sensor_task       | 4         | 3072         | 0    | Публикация сенсоров|
+ * | mqtt_ota_check_task    | 4         | 4096         | 0    | Проверка OTA флага |
+ * | mqtt_ota_progress_task | 4         | 4096         | 0    | Публикация OTA прогресса |
  * 
  * @author HydroNFT Team
  * @version 1.0
- * @date 2024
+ * @date 2026
  */
 
 #include <stdio.h>
@@ -73,19 +73,24 @@
 // Дескрипторы задач для управления (приостановка при OTA)
 TaskHandle_t ads1115_task_handle = NULL;  ///< Дескриптор задачи ADS1115
 
-// Семафор для корректной остановки ADS1115 (пункт 1.8)
-static SemaphoreHandle_t ads1115_running_sem = NULL;
+// Флаг остановки задачи ADS1115 для OTA (объявлен здесь, используется в ads1115_task и ads1115_stop_for_ota)
+static volatile bool ads1115_stop_requested = false;
+
+/// Тег для системы логирования ESP-IDF
+static const char *TAG = "main";
 
 /**
- * @brief Получить семафор задачи ADS1115
+ * @brief Остановить задачу ADS1115 для OTA обновления
  * 
- * Используется компонентом OTA для корректной остановки задачи ADS1115
+ * Устанавливает флаг остановки, после чего задача ADS1115
+ * перестанет опрашивать датчики и будет ждать в цикле.
  * 
- * @return SemaphoreHandle_t Семафор или NULL если ещё не создан
+ * @note Вызывается из ota_client перед началом OTA
  */
-SemaphoreHandle_t get_ads1115_running_sem(void)
+void ads1115_stop_for_ota(void)
 {
-    return ads1115_running_sem;
+    ads1115_stop_requested = true;
+    ESP_LOGI(TAG, "ADS1115: запрос на остановку для OTA отправлен");
 }
 
 // Объявления функций для работы с OTA прогрессом
@@ -130,10 +135,7 @@ void stop_ota_progress_task(void);
 static float dht_temperature = 0.0f;  ///< Температура с DHT
 static float dht_humidity = 0.0f;     ///< Влажность с DHT
 static SemaphoreHandle_t dht_data_mutex = NULL;  ///< Мьютекс для защиты данных DHT
-static bool dht_data_valid = false;   ///< Флаг: данные DHT получены успешно (ЛОГ-3)
-
-/// Тег для системы логирования ESP-IDF
-static const char *TAG = "main";
+static bool dht_data_valid = false;
 
 // ============================================================================
 // ПЕРЕМЕННЫЕ ДЛЯ РУЧНОГО УПРАВЛЕНИЯ СВЕТОМ
@@ -201,7 +203,7 @@ float get_dht_humidity(void)
 }
 
 /**
- * @brief Проверить валидность данных DHT (ЛОГ-3)
+ * @brief Проверить валидность данных DHT
  * @return true если данные были успешно получены хотя бы раз
  * @return false если данные ещё не получены
  */
@@ -314,9 +316,9 @@ bool get_valve_state(void)
  * @param pvParameters Параметры задачи (не используются)
  *
  * @note Задача работает на ядре 1 (APP_CPU)
- * @note Приоритет: 5 (выше среднего)
- * @note Размер стека: 2048 байт
- * @note Интервал чтения: 2 секунды
+ * @note Приоритет: 3
+ * @note Размер стека: 4096 байт
+ * @note Интервал чтения: 3 секунды
  *
  * @see dht_read_float_data()
  */
@@ -337,7 +339,7 @@ void dht_task(void *pvParameters)
 
     ESP_LOGI(TAG, "DHT датчик инициализирован (GPIO %d)", DHT_PIN);
     
-    // Пункт 2.3: Задержка на прогрев датчика после подачи питания
+    // Задержка на прогрев датчика после подачи питания
     ESP_LOGI(TAG, "DHT: Ожидание прогрева датчика (2 сек)...");
     vTaskDelay(pdMS_TO_TICKS(2000));
 
@@ -351,7 +353,7 @@ void dht_task(void *pvParameters)
             xSemaphoreTake(dht_data_mutex, portMAX_DELAY);
             dht_temperature = temperature;
             dht_humidity = humidity;
-            dht_data_valid = true;  // ЛОГ-3: флаг успешного получения данных
+            dht_data_valid = true;
             xSemaphoreGive(dht_data_mutex);
 
             ESP_LOGI(TAG, "DHT: Влажность=%.1f%% Температура=%.1f°C", humidity, temperature);
@@ -382,12 +384,12 @@ void dht_task(void *pvParameters)
  * 1. Инициализация ADS1115
  * 2. Циклическое чтение всех 4 каналов
  * 3. Вывод результатов в лог
- * 4. Пауза 500 мс
+ * 4. Пауза 1 секунда
  *
  * @param pvParameters Параметры задачи (не используются)
  *
  * @note Задача работает на ядре 1 (APP_CPU)
- * @note Приоритет: 5 (выше среднего)
+ * @note Приоритет: 4
  * @note Размер стека: 4096 байт
  *
  * @see ads1115_init()
@@ -400,15 +402,6 @@ void ads1115_task(void *pvParameters)
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Не удалось инициализировать ADS1115: %d", res);
         vTaskDelete(NULL);  // Удаляем задачу при ошибке
-        return;
-    }
-
-    // Получаем семафор для корректной остановки (пункт 1.8)
-    // Семафор создан в app_main() до запуска задач
-    SemaphoreHandle_t sem = get_ads1115_running_sem();
-    if (sem == NULL) {
-        ESP_LOGE(TAG, "Семафор ADS1115 не создан");
-        vTaskDelete(NULL);
         return;
     }
 
@@ -425,37 +418,36 @@ void ads1115_task(void *pvParameters)
      */
 
     while (1) {
-        // Пункт 1.8: Ждём разрешения на работу через семафор
-        if (xSemaphoreTake(sem, pdMS_TO_TICKS(600)) == pdTRUE) {
-            // Чтение всех 4 каналов одновременно
-            res = ads1115_measure_all_channels(measurements);
-
-            if (res == ESP_OK) {
-                // Вывод результатов каждого канала
-                for (int i = 0; i < 4; i++) {
-                    if (measurements[i].error == ESP_OK) {
-                        ESP_LOGI(TAG, "Канал %u: напряжение = %.04f В, raw = %d",
-                               measurements[i].channel,
-                               measurements[i].voltage,
-                               measurements[i].raw_value);
-                    } else {
-                        ESP_LOGE(TAG, "Канал %u: ошибка = %d",
-                               measurements[i].channel,
-                               measurements[i].error);
-                    }
-                }
-            } else {
-                ESP_LOGE(TAG, "Ошибка при измерениях: %d", res);
-            }
-
-            // Возвращаем семафор (разрешаем остановку)
-            xSemaphoreGive(sem);
-        } else {
-            // Таймаут истёк - семафор был взят другим (остановка для OTA)
-            ESP_LOGI(TAG, "ADS1115: семафор недоступен, ожидание...");
+        // Проверяем флаг остановки от OTA
+        if (ads1115_stop_requested) {
+            // OTA попросила остановиться - ждём в этом цикле
+            ESP_LOGI(TAG, "ADS1115: остановлен для OTA, ожидание...");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
 
-        // Ожидание 500 мс перед следующим измерением
+        // Читаем все 4 канала
+        res = ads1115_measure_all_channels(measurements);
+
+        if (res == ESP_OK) {
+            // Вывод результатов каждого канала
+            for (int i = 0; i < 4; i++) {
+                if (measurements[i].error == ESP_OK) {
+                    ESP_LOGI(TAG, "Канал %u: напряжение = %.04f В, raw = %d",
+                           measurements[i].channel,
+                           measurements[i].voltage,
+                           measurements[i].raw_value);
+                } else {
+                    ESP_LOGE(TAG, "Канал %u: ошибка = %d",
+                           measurements[i].channel,
+                           measurements[i].error);
+                }
+            }
+        } else {
+            ESP_LOGE(TAG, "Ошибка при измерениях: %d", res);
+        }
+
+        // Ожидание 1 секунда перед следующим измерением
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -481,7 +473,7 @@ void ads1115_task(void *pvParameters)
  *
  * @note Задача работает на ядре 0 (PRO_CPU) - сетевой стек
  * @note Приоритет: 4 (средний)
- * @note Размер стека: 2048 байт
+ * @note Размер стека: 3072 байт
  * @note Интервал публикации: 5 секунд
  *
  * @see mqtt_client_is_connected()
@@ -577,7 +569,7 @@ void mqtt_ota_check_task(void *pvParameters)
  *
  * @note Задача работает на ядре 0 (PRO_CPU)
  * @note Приоритет: 3 (ниже среднего)
- * @note Размер стека: 2048 байт
+ * @note Размер стека: 3072 байт
  * @note Интервал проверки: 1 минута
  */
 void light_schedule_task(void *pvParameters)
@@ -585,7 +577,7 @@ void light_schedule_task(void *pvParameters)
     const int on_hour = CONFIG_LIGHT_ON_HOUR;
     const int off_hour = CONFIG_LIGHT_OFF_HOUR;
 
-    // ЛОГ-4: Валидация конфигурации - часы включения и выключения должны различаться
+    // Валидация конфигурации - часы включения и выключения должны различаться
     if (on_hour == off_hour) {
         ESP_LOGE(TAG, "ОШИБКА: LIGHT_ON_HOUR (%d) равен LIGHT_OFF_HOUR (%d)!", on_hour, off_hour);
         ESP_LOGE(TAG, "Свет не будет управляться. Исправьте конфигурацию в menuconfig!");
@@ -891,7 +883,7 @@ void app_main(void)
     };
     gpio_config(&valve_io_config);
 
-    // ПОТ-10: Устанавливаем GPIO в безопасное состояние (выключено)
+    // Устанавливаем GPIO в безопасное состояние (выключено)
     gpio_set_level(PUMP_PIN, 0);
     gpio_set_level(LIGHT_PIN, 0);
     gpio_set_level(VALVE_PIN, 0);
@@ -978,22 +970,10 @@ void app_main(void)
     sntp_client_init();
 
     // ==========================================================================
-    // 6. ИНИЦИАЛИЗАЦИЯ СЕМАФОРА ДЛЯ ADS1115
+    // 6. ИНИЦИАЛИЗАЦИЯ МЬЮТЕКСА ДЛЯ DHT
     // ==========================================================================
-    
-    // Создаём семафор для корректной остановки ADS1115 до запуска задачи
-    // Это исправляет race condition, когда mqtt_ota_check_task() пытается получить
-    // семафор до его создания в ads1115_task()
-    ads1115_running_sem = xSemaphoreCreateBinary();
-    if (ads1115_running_sem == NULL) {
-        ESP_LOGE(TAG, "Не удалось создать семафор ADS1115");
-        return; // Прерываем инициализацию
-    }
-    // Начальное состояние: задача запущена (семафор доступен)
-    xSemaphoreGive(ads1115_running_sem);
-    ESP_LOGI(TAG, "Семафор ADS1115 создан и инициализирован");
 
-    // Создаём мьютекс для защиты данных DHT (КРИТ-3)
+    // Создаём мьютекс для защиты данных DHT
     dht_data_mutex = xSemaphoreCreateMutex();
     if (dht_data_mutex == NULL) {
         ESP_LOGE(TAG, "Не удалось создать мьютекс DHT");
@@ -1006,15 +986,10 @@ void app_main(void)
     // ==========================================================================
 
     // Задача чтения DHT (приоритет 3, ядро 1 - APP_CPU)
-    // ПОТ-6: Стек увеличен до 4096 байт для запаса при логировании
-    // DHT использует GPIO, работает на ядре 1
-    // Приоритет 3
-    // Стек: 4096 байт - dht_read_float_data (может блокироваться),
-    // ESP_LOGI/ESP_LOGW, 2 float переменные (8 байт), esp_task_wdt, запас 3×
     xTaskCreatePinnedToCore(
         dht_task,
         "dht_task",
-        4096,  // ПОТ-6: увеличено до 4096 байт (watchdog timeout)
+        4096,
         NULL,
         3,
         NULL,
@@ -1022,29 +997,21 @@ void app_main(void)
     );
 
     // Задача чтения ADS1115 (приоритет 4, ядро 1 - APP_CPU)
-    // ПОТ-1: Приоритет увеличен до 4 для уменьшения задержек I2C при чтении DHT
-    // I2C драйвер работает на ядре 1, поэтому оставляем здесь
-    // Стек: 4096 байт - measurements[4] (48 байт),
-    // медианный фильтр sorted[5] (20 байт), ESP_LOGI в цикле, I2C драйвер, запас 3×
     xTaskCreatePinnedToCore(
         ads1115_task,
         "ads1115_task",
-        4096,  // 4096 байт
+        4096,
         NULL,
-        4,  // ПОТ-1: увеличено с 3 до 4
+        4,
         &ads1115_task_handle,  // Сохраняем дескриптор для приостановки при OTA
         APP_CPU_NUM  // Ядро 1
     );
 
     // Задача публикации сенсоров в MQTT (приоритет 4, ядро 0 - PRO_CPU)
-    // ПОТ-7: Стек увеличен до 3072 байт для запаса при логировании
-    // Сетевой стек и Wi-Fi работают на ядре 0
-    // Стек: 3072 байт - mqtt_client_publish_sensor_data вызывается,
-    // 6 публикаций, msg[64] на стеке, запас 4×
     xTaskCreatePinnedToCore(
         mqtt_sensor_task,
         "mqtt_sensor_task",
-        3072,  // ПОТ-7: увеличено с 2048 до 3072 байт
+        3072,
         NULL,
         4,
         NULL,
@@ -1052,13 +1019,10 @@ void app_main(void)
     );
 
     // Задача проверки флага OTA из MQTT (приоритет 4, ядро 0 - PRO_CPU)
-    // OTA использует HTTP и запись во flash - лучше на ядре 0
-    // Стек: 4096 байт - ota_start_task, xSemaphoreTake,
-    // start_ota_progress_task, ESP_LOGI, запас 3×
     xTaskCreatePinnedToCore(
         mqtt_ota_check_task,
         "mqtt_ota_check_task",
-        4096,  // ПОТ-10: увеличено с 3072 до 4096 байт
+        4096,
         NULL,
         4,
         NULL,
@@ -1066,13 +1030,10 @@ void app_main(void)
     );
 
     // Задача управления светом по расписанию (приоритет 3, ядро 0 - PRO_CPU)
-    // Использует SNTP время для включения/выключения света
-    // Стек: 3072 байт - set_light_state, ESP_LOGI, localtime_r (struct tm ~64 байт),
-    // локальные переменные (time_t, int), запас 3×
     xTaskCreatePinnedToCore(
         light_schedule_task,
         "light_schedule_task",
-        3072,  // ПОТ-9: увеличено с 2048 до 3072 байт (переполнение стека)
+        3072,
         NULL,
         3,
         NULL,
@@ -1080,8 +1041,6 @@ void app_main(void)
     );
 
     // Задача управления насосом по расписанию (приоритет 3, ядро 0 - PRO_CPU)
-    // ЗАГЛУШКА - логика управления будет добавлена позже
-    // Стек: 3072 байт - ESP_LOGI, localtime_r, ESP_LOGI, запас
     xTaskCreatePinnedToCore(
         pump_schedule_task,
         "pump_schedule_task",
@@ -1093,8 +1052,6 @@ void app_main(void)
     );
 
     // Задача управления клапаном по расписанию (приоритет 3, ядро 0 - PRO_CPU)
-    // ЗАГЛУШКА - логика управления будет добавлена позже
-    // Стек: 3072 байт - ESP_LOGI, localtime_r, ESP_LOGI, запас
     xTaskCreatePinnedToCore(
         valve_schedule_task,
         "valve_schedule_task",

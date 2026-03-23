@@ -23,13 +23,13 @@
 #include "errno.h"
 #include "ota_client.h"
 #include "hydro_mqtt_client.h"  // Для публикации статуса OTA и версии прошивки
-#include "esp_task_wdt.h"       // Для сброса watchdog (пункт 1.7)
+#include "esp_task_wdt.h"
 
 // Объявляем внешние функции из main.c (компонент не может зависеть от main)
 extern void set_pump_state(bool state, bool manual);
 extern void set_light_state(bool state, bool manual);
 extern void set_valve_state(bool state, bool manual);
-extern SemaphoreHandle_t get_ads1115_running_sem(void);
+extern void ads1115_stop_for_ota(void);  // Функция остановки ADS1115 для OTA
 
 #if CONFIG_EXAMPLE_CONNECT_WIFI
 #include "esp_wifi.h"
@@ -158,9 +158,6 @@ static void ota_task(void *pvParameter)
     s_ota_total_bytes = 0;
     s_ota_active = true;
 
-    // ПОТ-11: Сбрасываем last_progress в начале OTA сессии
-    // (переменная static внутри цикла, но задача создаётся заново при каждом OTA)
-
     const esp_partition_t *configured = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
 
@@ -208,10 +205,10 @@ static void ota_task(void *pvParameter)
 
     int binary_file_length = 0;
     bool image_header_was_checked = false;
-    int last_progress = 0;  // КРИТ-6: локальная переменная для корректного сброса между сессиями OTA
+    int last_progress = 0;
 
     while (1) {
-        // Сброс watchdog в каждом цикле для предотвращения перезагрузки
+        // Сброс watchdog в каждом цикле
         esp_task_wdt_reset();
 
         int data_read = esp_http_client_read(client, ota_write_data, BUFFSIZE);
@@ -219,7 +216,6 @@ static void ota_task(void *pvParameter)
         if (data_read < 0) {
             ESP_LOGE(TAG, "Ошибка: ошибка чтения SSL данных");
             http_cleanup(client);
-            // КРИТ-4: Прерываем OTA перед перезагрузкой, чтобы не повредить flash
             if (update_handle > 0) {
                 esp_ota_abort(update_handle);
             }
@@ -274,16 +270,14 @@ static void ota_task(void *pvParameter)
                     set_valve_state(false, false);
                     vTaskDelay(pdMS_TO_TICKS(100));  // Даём время на отключение реле
 
-                    // Корректная остановка ADS1115 через семафор
-                    SemaphoreHandle_t sem = get_ads1115_running_sem();
-                    if (sem != NULL) {
-                        if (xSemaphoreTake(sem, pdMS_TO_TICKS(1000)) == pdTRUE) {
-                            ESP_LOGI(TAG, "ADS1115 остановлен корректно (семафор захвачен)");
-                            // НЕ возвращаем семафор — задача ADS1115 останется заблокированной
-                        } else {
-                            ESP_LOGW(TAG, "Таймаут остановки ADS1115 — продолжаем OTA");
-                        }
-                    }
+                    // Корректная остановка ADS1115 через флаг
+                    ESP_LOGI(TAG, "Останавливаем ADS1115...");
+                    ads1115_stop_for_ota();
+                    
+                    // Ждём небольшую задержку чтобы задача ADS1115 успела обработать флаг
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    
+                    ESP_LOGI(TAG, "ADS1115 остановлен, начинаем OTA обновление...");
 
                     err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
                     if (err != ESP_OK) {

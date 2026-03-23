@@ -1,20 +1,10 @@
 #pragma once
 
 #include <stdbool.h>
-#include <freertos/semphr.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/**
- * @brief Получить семафор задачи ADS1115
- * 
- * Используется компонентом OTA для корректной остановки задачи ADS1115
- * 
- * @return SemaphoreHandle_t Семафор или NULL если ещё не создан
- */
-SemaphoreHandle_t get_ads1115_running_sem(void);
 
 /**
  * @brief Установить состояние насоса
@@ -68,11 +58,21 @@ float get_dht_temperature(void);
 float get_dht_humidity(void);
 
 /**
- * @brief Проверить валидность данных DHT (ЛОГ-3)
+ * @brief Проверить валидность данных DHT
  * @return true если данные были успешно получены хотя бы раз
  * @return false если данные ещё не получены
  */
 bool is_dht_data_valid(void);
+
+/**
+ * @brief Остановить задачу ADS1115 для OTA обновления
+ * 
+ * Устанавливает флаг остановки, после чего задача ADS1115
+ * перестанет опрашивать датчики и будет ждать в цикле.
+ * 
+ * @note Вызывается из ota_client перед началом OTA
+ */
+void ads1115_stop_for_ota(void);
 
 #ifdef __cplusplus
 }
