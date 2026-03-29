@@ -22,20 +22,11 @@ esp_err_t ads1115_init(void);
 esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage);
 
 /**
- * @brief Чтение сырых ADC значений с определенного канала
- * @param channel Номер канала (0-3)
- * @param raw_value Указатель для хранения сырых ADC значений
- * @return ESP_OK при успехе, код ошибки в противном случае
- */
-esp_err_t ads1115_read_raw(uint8_t channel, int16_t *raw_value);
-
-/**
  * @brief Структура для хранения измерения канала
  */
 typedef struct {
     uint8_t channel;    // Номер канала (0-3)
     float voltage;      // Измеренное напряжение
-    int16_t raw_value;  // Сырое значение ADC
     esp_err_t error;    // Код ошибки измерения
 } ads1115_measurement_t;
 

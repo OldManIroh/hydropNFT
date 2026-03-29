@@ -87,133 +87,140 @@ dependencies:
     - esp32s2
     - esp32s3
     version: 2.1.1
-  espressif/button:
-    component_hash: d0afa32f0e50d60bc0c6fc23f7eea98adc6b02cfe70b590bc52c23c506745287
+  espressif/ethernet_init:
+    component_hash: b7303f1482091766b9b653ec8332775a9485f4df3c69141577de82847c4d2adf
     dependencies:
-    - name: espressif/cmake_utilities
+    - matches:
+      - if: $CONFIG{ETHERNET_SPI_USE_CH390} == 1
+      name: espressif/ch390
       registry_url: https://components.espressif.com
       require: private
       version: '*'
-    - name: idf
-      require: private
-      version: '>=4.0'
-    source:
+    - matches:
+      - if: $CONFIG{ETHERNET_SPI_USE_DM9051} == 1
+      name: espressif/dm9051
       registry_url: https://components.espressif.com
-      type: service
-    version: 4.1.6
-  espressif/cmake_utilities:
-    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
-    dependencies:
-    - name: idf
       require: private
-      version: '>=4.1'
-    source:
+      rules:
+      - if: idf_version >=6.0
+        version: ^1.0.0
+      version: '*'
+    - matches:
+      - if: idf_version >=6.0
+        version: ^1.0.0
+      name: espressif/dp83848
       registry_url: https://components.espressif.com
-      type: service
-    version: 0.5.3
-  espressif/touch_button:
-    component_hash: 1f33768b4a64b7671e1012df6ed6090040526839a4898d9a0d9f15eb892ce6c3
-    dependencies:
-    - name: espressif/cmake_utilities
+      require: private
+      rules:
+      - if: target in [esp32, esp32p4]
+      - if: $CONFIG{ETHERNET_PHY_USE_DP83848} == 1
+      version: '*'
+    - matches:
+      - if: $CONFIG{ETHERNET_SPI_USE_ENC28J60} == 1
+      name: espressif/enc28j60
       registry_url: https://components.espressif.com
       require: private
       version: '*'
-    - name: espressif/button
+    - matches:
+      - if: idf_version >=6.0
+        version: ^1.0.0
+      name: espressif/ip101
       registry_url: https://components.espressif.com
-      require: public
-      version: ^4
-    - name: espressif/touch_button_sensor
+      require: private
+      rules:
+      - if: target in [esp32, esp32p4]
+      - if: $CONFIG{ETHERNET_PHY_USE_IP101} == 1
+      version: '*'
+    - matches:
+      - if: idf_version >=6.0
+        version: ^1.0.0
+      name: espressif/ksz80xx
       registry_url: https://components.espressif.com
-      require: public
-      version: ^0.2.2
+      require: private
+      rules:
+      - if: target in [esp32, esp32p4]
+      - if: $CONFIG{ETHERNET_PHY_USE_KSZ80XX} == 1
+      version: '*'
+    - matches:
+      - if: $CONFIG{ETHERNET_SPI_USE_KSZ8851SNL} == 1
+      name: espressif/ksz8851snl
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=6.0
+        version: ^1.0.0
+      version: '*'
+    - matches:
+      - if: $CONFIG{ETHERNET_SPI_USE_LAN865X} == 1
+      name: espressif/lan865x
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^0.1.1
+    - name: espressif/lan867x
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target in [esp32, esp32p4]
+      - if: $CONFIG{ETHERNET_PHY_USE_LAN867X} == 1
+      version: '>=2.0.0'
+    - matches:
+      - if: idf_version >=6.0
+        version: ^1.0.0
+      name: espressif/lan87xx
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target in [esp32, esp32p4]
+      - if: $CONFIG{ETHERNET_PHY_USE_LAN87XX} == 1
+      version: '*'
+    - matches:
+      - if: idf_version >=6.0
+        version: ^1.0.0
+      name: espressif/rtl8201
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target in [esp32, esp32p4]
+      - if: $CONFIG{ETHERNET_PHY_USE_RTL8201} == 1
+      version: '*'
+    - matches:
+      - if: $CONFIG{ETHERNET_SPI_USE_W5500} == 1
+      name: espressif/w5500
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=6.0
+        version: ^1.0.0
+      version: '*'
     - name: idf
       require: private
-      version: '>=4.4'
+      version: '>=5.4.3,!=5.5.0,!=5.5.1'
     source:
       registry_url: https://components.espressif.com/
       type: service
-    targets:
-    - esp32
-    - esp32s2
-    - esp32s3
-    - esp32p4
-    version: 0.1.0~1
-  espressif/touch_button_sensor:
-    component_hash: 25570fae2d9bf3590a4fea6ed56ea69c45b64d423849b9f165f7721f5ae0b5a5
+    version: 1.2.0
+  espressif/mqtt:
+    component_hash: ffdad5659706b4dc14bc63f8eb73ef765efa015bf7e9adf71c813d52a2dc9342
     dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.*
     - name: idf
       require: private
-      version: '>=4.4,<6.0'
-    - name: espressif/touch_sensor_fsm
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.8.1~1,<0.8.2'
-    - name: espressif/touch_sensor_lowlevel
-      registry_url: https://components.espressif.com
-      require: public
-      version: '>=0.9.1~1,<0.10.0'
+      version: '>=5.3'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
-    targets:
-    - esp32
-    - esp32s2
-    - esp32s3
-    - esp32p4
-    - linux
-    version: 0.2.2~1
-  espressif/touch_sensor_fsm:
-    component_hash: c1918e4dc4d354ee4a1c918d99eff987dd50c2b99b153cc99afe41a1f41b5dcd
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.*
-    - name: idf
-      require: private
-      version: '>=4.4'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    targets:
-    - esp32
-    - esp32s2
-    - esp32s3
-    - esp32p4
-    - linux
-    version: 0.8.1~1
-  espressif/touch_sensor_lowlevel:
-    component_hash: b8d5f8c785c91619d4fe531c874c3897bede0428fb3fe854bea4048e12348e1f
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.*
-    - name: idf
-      require: private
-      version: '>=4.4,<6.0'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    targets:
-    - esp32
-    - esp32s2
-    - esp32s3
-    - esp32p4
-    - linux
-    version: 0.9.1~1
+    version: 1.0.0
   idf:
     source:
       type: idf
-    version: 5.5.3
+    version: 6.0.0
   protocol_examples_common:
-    dependencies: []
+    dependencies:
+    - name: espressif/ethernet_init
+      rules:
+      - if: target != linux
+      version: ~1.2.0
     source:
-      path: /home/iroh/.espressif/v5.5.3/esp-idf/examples/common_components/protocol_examples_common
+      path: ../../../.espressif/v6.0/esp-idf/examples/common_components/protocol_examples_common
       type: local
     version: '*'
 direct_dependencies:
@@ -221,8 +228,8 @@ direct_dependencies:
 - esp-idf-lib/dht
 - esp-idf-lib/esp_idf_lib_helpers
 - esp-idf-lib/i2cdev
-- espressif/touch_button
+- espressif/mqtt
 - protocol_examples_common
-manifest_hash: 4132e0bc6f8d21ed8d1e699033c22b9551c86d2a8d26e9136515abf9850a01d4
+manifest_hash: dd3b79b8ae1a760ac8e1d788d00a975edec27b3f7b3fd071a755a3d665d6b168
 target: esp32
-version: 2.0.0
+version: 3.0.0

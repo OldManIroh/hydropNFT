@@ -413,7 +413,6 @@ void ads1115_task(void *pvParameters)
      * Структура measurements[i]:
      * - channel: номер канала (0-3)
      * - voltage: напряжение в вольтах
-     * - raw_value: сырое значение ADC
      * - error: код ошибки (ESP_OK если успешно)
      */
 
@@ -433,10 +432,9 @@ void ads1115_task(void *pvParameters)
             // Вывод результатов каждого канала
             for (int i = 0; i < 4; i++) {
                 if (measurements[i].error == ESP_OK) {
-                    ESP_LOGI(TAG, "Канал %u: напряжение = %.04f В, raw = %d",
+                    ESP_LOGI(TAG, "Канал %u: напряжение = %.04f В",
                            measurements[i].channel,
-                           measurements[i].voltage,
-                           measurements[i].raw_value);
+                           measurements[i].voltage);
                 } else {
                     ESP_LOGE(TAG, "Канал %u: ошибка = %d",
                            measurements[i].channel,
@@ -976,10 +974,12 @@ void app_main(void)
     // Создаём мьютекс для защиты данных DHT
     dht_data_mutex = xSemaphoreCreateMutex();
     if (dht_data_mutex == NULL) {
-        ESP_LOGE(TAG, "Не удалось создать мьютекс DHT");
-        return;
+        ESP_LOGE(TAG, "Критическая ошибка: не удалось создать мьютекс DHT");
+        ESP_LOGW(TAG, "Устройство продолжит работу, но DHT данные не будут защищены");
+        // Не возвращаемся - задачи уже запущены, продолжаем работу
+    } else {
+        ESP_LOGI(TAG, "Мьютекс DHT создан");
     }
-    ESP_LOGI(TAG, "Мьютекс DHT создан");
 
     // ==========================================================================
     // 7. ЗАПУСК ЗАДАЧ FREERTOS

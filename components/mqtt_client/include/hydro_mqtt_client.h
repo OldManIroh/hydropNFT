@@ -224,6 +224,16 @@ void mqtt_client_publish_firmware_version(const char *version);
  */
 void *mqtt_client_get_handle(void);
 
+/**
+ * @brief Публикация MAC адреса устройства в MQTT
+ *
+ * Отправляет MAC адрес устройства в топик hydro/system/mac_address
+ *
+ * @note Топик: hydro/system/mac_address
+ * @note Формат: "XX:XX:XX:XX:XX:XX"
+ */
+void mqtt_client_publish_mac_address(void);
+
 #ifdef __cplusplus
 }
 #endif

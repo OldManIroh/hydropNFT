@@ -29,6 +29,7 @@
 #include "mqtt_client.h"           // Заголовочный файл ESP-IDF MQTT библиотеки
 #include "hydro_mqtt_client.h"     // Локальный заголовочный файл компонента
 #include "esp_ota_ops.h"           // Для получения версии прошивки
+#include "esp_mac.h"               // Для получения MAC адреса
 #include "main.h"                  // Для функций управления GPIO и получения данных DHT
 #include "ads1115.h"               // Для получения данных с ADS1115
 
@@ -312,6 +313,35 @@ static void send_discovery_ota_status(esp_mqtt_client_handle_t client)
 }
 
 /**
+ * @brief Отправка конфигурации сенсора MAC адреса для Home Assistant Discovery
+ * 
+ * @param client Дескриптор MQTT клиента
+ */
+static void send_discovery_mac_address(esp_mqtt_client_handle_t client)
+{
+    char topic[128];
+    char payload[1024];
+
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/hydroesp32/mac_address/config");
+    
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"MAC адрес\","
+             "\"state_topic\":\"hydro/system/mac_address\","
+             "\"unique_id\":\"esp32_hydro_mac_address\","
+             "\"icon\":\"mdi:network\","
+             "\"entity_category\":\"diagnostic\","
+             "\"device\":{"
+             "\"identifiers\":[\"esp32_hydro_controller\"],"
+             "\"name\":\"Hydroponic system\","
+             "\"model\":\"ESP32\","
+             "\"manufacturer\":\"HydroNFT\""
+             "}}");
+
+    esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "MAC address discovery sent");
+}
+
+/**
  * @brief Публикация состояния выключателя
  * 
  * Отправляет текущее состояние выключателя (ON/OFF) в MQTT топик.
@@ -402,6 +432,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // 13. Кнопка обновления прошивки
             send_discovery_button(mqtt_client, "ota_update", "Обновление прошивки",
                                   "hydro/ota/update", "START");
+            // 14. MAC адрес устройства
+            send_discovery_mac_address(mqtt_client);
 
             // Подписываемся на топики команд
             // QoS=1 гарантирует доставку сообщений
@@ -430,6 +462,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     ESP_LOGI(TAG, "Published firmware version on connect: %s", app_info.version);
                 }
             }
+
+            // Публикуем MAC адрес устройства в диагностический раздел
+            mqtt_client_publish_mac_address();
             break;
 
         // ================================================================
@@ -752,6 +787,33 @@ void mqtt_client_publish_firmware_version(const char *version)
     if (mqtt_connected && mqtt_client && version) {
         esp_mqtt_client_publish(mqtt_client, "hydro/firmware/version", version, 0, 1, 1);
         ESP_LOGI(TAG, "Published firmware version: %s", version);
+    }
+}
+
+/**
+ * @brief Публикация MAC адреса устройства в MQTT
+ * 
+ * Отправляет MAC адрес устройства в топик hydro/system/mac_address
+ * 
+ * @note Топик: hydro/system/mac_address
+ * @note Формат: "XX:XX:XX:XX:XX:XX"
+ */
+void mqtt_client_publish_mac_address(void)
+{
+    if (mqtt_connected && mqtt_client) {
+        uint8_t mac_addr[6];
+        char mac_str[18];
+        
+        // Получаем MAC адрес устройства
+        esp_read_mac(mac_addr, ESP_MAC_WIFI_STA);
+        
+        // Форматируем MAC адрес в строку
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac_addr[0], mac_addr[1], mac_addr[2],
+                 mac_addr[3], mac_addr[4], mac_addr[5]);
+        
+        esp_mqtt_client_publish(mqtt_client, "hydro/system/mac_address", mac_str, 0, 1, 1);
+        ESP_LOGI(TAG, "Published MAC address: %s", mac_str);
     }
 }
 // /**

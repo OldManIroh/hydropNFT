@@ -301,7 +301,6 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
         // Инициализация структуры измерения
         measurements[ch].channel = ch;
         measurements[ch].voltage = 0.0f;
-        measurements[ch].raw_value = 0;
         measurements[ch].error = ESP_OK;
 
         // Читаем напряжение с канала
@@ -313,8 +312,6 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
             overall_result = res;
             continue;
         }
-
-        measurements[ch].raw_value = 0;
 
         // Инициализация буфера при первом измерении
         if (!filter_state.buffer_filled) {

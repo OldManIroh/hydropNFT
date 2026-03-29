@@ -502,5 +502,11 @@ void ota_init(void)
 
 void ota_start_task(void)
 {
+    // Защита от повторного запуска OTA
+    if (s_ota_active) {
+        ESP_LOGW(TAG, "OTA уже выполняется, игнорируем команду");
+        return;
+    }
+    
     xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
 }
