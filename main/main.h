@@ -1,78 +1,86 @@
-#pragma once
+/**
+ * @file main.h
+ * @brief Заголовочный файл приложения HydroNFT
+ *
+ * Объявления задач FreeRTOS и вспомогательных функций OTA прогресса.
+ * Для управления оборудованием используйте device_control.h.
+ *
+ * @author HydroNFT Team
+ * @version 2.0
+ * @date 2026
+ */
 
-#include <stdbool.h>
+#pragma once
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/**
- * @brief Установить состояние насоса
- * @param state Состояние: true = включить, false = выключить
- * @param manual Ручное управление: true = ручное (из MQTT, 5 мин), false = авто
- */
-void set_pump_state(bool state, bool manual);
+// ============================================================================
+// ОБЪЯВЛЕНИЯ ЗАДАЧ FREERTOS
+// ============================================================================
 
 /**
- * @brief Установить состояние света
- * @param state Состояние: true = включить, false = выключить
- * @param manual Ручное управление: true = ручное (из MQTT, 2 часа), false = авто (расписание)
+ * @brief Задача чтения DHT датчика
+ * @param pvParameters Параметры задачи (не используются)
  */
-void set_light_state(bool state, bool manual);
+void dht_task(void *pvParameters);
 
 /**
- * @brief Установить состояние клапана
- * @param state Состояние: true = открыть, false = закрыть
- * @param manual Ручное управление: true = ручное (из MQTT, 5 мин), false = авто
+ * @brief Задача чтения ADS1115
+ * @param pvParameters Параметры задачи (не используются)
  */
-void set_valve_state(bool state, bool manual);
+void ads1115_task(void *pvParameters);
 
 /**
- * @brief Получить состояние насоса
- * @return true если включен, false если выключен
+ * @brief Задача публикации сенсоров в MQTT
+ * @param pvParameters Параметры задачи (не используются)
  */
-bool get_pump_state(void);
+void mqtt_sensor_task(void *pvParameters);
 
 /**
- * @brief Получить состояние света
- * @return true если включен, false если выключен
+ * @brief Задача проверки флага OTA из MQTT
+ * @param pvParameters Параметры задачи (не используются)
  */
-bool get_light_state(void);
+void mqtt_ota_check_task(void *pvParameters);
 
 /**
- * @brief Получить состояние клапана
- * @return true если открыт, false если закрыт
+ * @brief Задача управления светом по расписанию
+ * @param pvParameters Параметры задачи (не используются)
  */
-bool get_valve_state(void);
+void light_schedule_task(void *pvParameters);
 
 /**
- * @brief Получить температуру с DHT датчика
- * @return Температура в °C
+ * @brief Задача управления насосом и клапаном
+ * @param pvParameters Параметры задачи (не используются)
  */
-float get_dht_temperature(void);
+void pump_valve_schedule_task(void *pvParameters);
 
 /**
- * @brief Получить влажность с DHT датчика
- * @return Влажность в %
+ * @brief Задача приёма ESP-NOW
+ * @param pvParameters Параметры задачи (не используются)
  */
-float get_dht_humidity(void);
+void espnow_receiver_task(void *pvParameters);
 
 /**
- * @brief Проверить валидность данных DHT
- * @return true если данные были успешно получены хотя бы раз
- * @return false если данные ещё не получены
+ * @brief Задача публикации прогресса OTA в MQTT
+ * @param pvParameters Параметры задачи (не используются)
  */
-bool is_dht_data_valid(void);
+void mqtt_ota_progress_task(void *pvParameters);
+
+// ============================================================================
+// УПРАВЛЕНИЕ ЗАДАЧЕЙ ПРОГРЕССА OTA
+// ============================================================================
 
 /**
- * @brief Остановить задачу ADS1115 для OTA обновления
- * 
- * Устанавливает флаг остановки, после чего задача ADS1115
- * перестанет опрашивать датчики и будет ждать в цикле.
- * 
- * @note Вызывается из ota_client перед началом OTA
+ * @brief Запуск задачи публикации прогресса OTA
  */
-void ads1115_stop_for_ota(void);
+void start_ota_progress_task(void);
+
+/**
+ * @brief Остановка задачи публикации прогресса OTA
+ */
+void stop_ota_progress_task(void);
 
 #ifdef __cplusplus
 }

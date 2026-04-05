@@ -1,0 +1,21 @@
+menu "ESP-NOW Receiver Configuration"
+
+    config ESPNOW_CHANNEL
+        int "ESP-NOW Wi-Fi Channel"
+        default 10
+        range 1 14
+        help
+            Wi-Fi channel for ESP-NOW communication.
+            Must match the sender's channel (espnow_binary_state) AND
+            the Wi-Fi router channel. ESP32 cannot operate on different
+            channels simultaneously.
+            Default: 10
+
+    config ESPNOW_PMK
+        string "ESP-NOW Primary Master Key"
+        default "pmk12345567890123"
+        help
+            ESP-NOW primary master key for the receiver.
+            Must match the sender's PMK. Length must be 16 bytes.
+
+endmenu

@@ -25,11 +25,7 @@
 #include "hydro_mqtt_client.h"  // Для публикации статуса OTA и версии прошивки
 #include "esp_task_wdt.h"
 
-// Объявляем внешние функции из main.c (компонент не может зависеть от main)
-extern void set_pump_state(bool state, bool manual);
-extern void set_light_state(bool state, bool manual);
-extern void set_valve_state(bool state, bool manual);
-extern void ads1115_stop_for_ota(void);  // Функция остановки ADS1115 для OTA
+#include "device_control.h"    // Для управления оборудованием и остановки ADS1115
 
 #if CONFIG_EXAMPLE_CONNECT_WIFI
 #include "esp_wifi.h"
@@ -265,14 +261,14 @@ static void ota_task(void *pvParameter)
 
                     // БЕЗОПАСНОСТЬ: Отключаем насос, свет и клапан перед записью во flash
                     ESP_LOGW(TAG, "БЕЗОПАСНОСТЬ: Отключение насоса, света и клапана перед OTA...");
-                    set_pump_state(false, false);
-                    set_light_state(false, false);
-                    set_valve_state(false, false);
+                    device_control_set_pump_state(false);
+                    device_control_set_light_state(false);
+                    device_control_set_valve_state(false);
                     vTaskDelay(pdMS_TO_TICKS(100));  // Даём время на отключение реле
 
                     // Корректная остановка ADS1115 через флаг
                     ESP_LOGI(TAG, "Останавливаем ADS1115...");
-                    ads1115_stop_for_ota();
+                    device_control_ads1115_stop_for_ota();
                     
                     // Ждём небольшую задержку чтобы задача ADS1115 успела обработать флаг
                     vTaskDelay(pdMS_TO_TICKS(200));
@@ -508,5 +504,5 @@ void ota_start_task(void)
         return;
     }
     
-    xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(&ota_task, "ota_task", 8192, NULL, 5, NULL, PRO_CPU_NUM);
 }

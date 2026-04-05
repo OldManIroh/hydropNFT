@@ -50,6 +50,9 @@ static bool ads1115_initialized = false;
 /// Мьютекс для защиты доступа к I2C шине
 static SemaphoreHandle_t ads1115_mutex = NULL;
 
+/// Мьютекс для защиты latest_sensor_data от race condition между ядрами
+static SemaphoreHandle_t s_data_mutex = NULL;
+
 /// Размер окна медианного фильтра
 #define ADS1115_FILTER_WINDOW_SIZE 5
 
@@ -137,10 +140,20 @@ esp_err_t ads1115_init(void)
     if (ads1115_mutex == NULL) {
         ads1115_mutex = xSemaphoreCreateMutex();
         if (ads1115_mutex == NULL) {
-            ESP_LOGE(TAG, "Не удалось создать мьютекс");
+            ESP_LOGE(TAG, "Не удалось создать мьютекс I2C");
             return ESP_ERR_NO_MEM;
         }
-        ESP_LOGI(TAG, "Мьютекс ADS1115 создан");
+        ESP_LOGI(TAG, "Мьютекс I2C ADS1115 создан");
+    }
+
+    // Создаём мьютекс для защиты latest_sensor_data
+    if (s_data_mutex == NULL) {
+        s_data_mutex = xSemaphoreCreateMutex();
+        if (s_data_mutex == NULL) {
+            ESP_LOGE(TAG, "Не удалось создать мьютекс данных");
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "Мьютекс данных ADS1115 создан");
     }
 
     // Инициализация библиотеки I2C
@@ -334,16 +347,19 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
         filter_state.buffer_filled = true;  // Буфер заполнен хотя бы один раз
     }
 
-    // Обновляем последние данные для доступа из MQTT
-    latest_sensor_data.valid = false;
-    latest_sensor_data.valid_channels = 0;
+    // Обновляем последние данные для доступа из MQTT (под мьютексом)
+    if (xSemaphoreTake(s_data_mutex, portMAX_DELAY) == pdTRUE) {
+        latest_sensor_data.valid = false;
+        latest_sensor_data.valid_channels = 0;
 
-    for (size_t ch = 0; ch < 4; ch++) {
-        if (measurements[ch].error == ESP_OK) {
-            latest_sensor_data.voltage[ch] = measurements[ch].voltage;
-            latest_sensor_data.valid = true;
-            latest_sensor_data.valid_channels |= (1 << ch);
+        for (size_t ch = 0; ch < 4; ch++) {
+            if (measurements[ch].error == ESP_OK) {
+                latest_sensor_data.voltage[ch] = measurements[ch].voltage;
+                latest_sensor_data.valid = true;
+                latest_sensor_data.valid_channels |= (1 << ch);
+            }
         }
+        xSemaphoreGive(s_data_mutex);
     }
 
     return overall_result;
@@ -351,20 +367,24 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
 
 /**
  * @brief Получить последние измеренные данные с ADS1115
- * @return Указатель на структуру с данными (никогда не NULL)
+ * @return Копия структуры с данными (валидность в поле valid)
  *
- * Возвращает указатель на статическую структуру latest_sensor_data,
- * которая обновляется в функции ads1115_measure_all_channels().
+ * Возвращает копию latest_sensor_data, защищённую мьютексом.
  *
  * @note Данные обновляются в ads1115_task() каждые 1 секунду
- * @note Поле valid_channels содержит битовую маску валидных каналов:
- *       - бит 0 установлен = канал 0 валиден
- *       - бит 1 установлен = канал 1 валиден, и т.д.
- * @note Функция не требует мьютекса — чтение bool и float атомарно на ESP32
+ * @note Поле valid_channels содержит битовую маску валидных каналов
+ * @note Функция потокобезопасна — копирует данные под мьютексом
  */
-const ads1115_sensor_data_t* ads1115_get_latest_data(void)
+ads1115_sensor_data_t ads1115_get_latest_data(void)
 {
-    return &latest_sensor_data;
+    ads1115_sensor_data_t copy = {0};
+
+    if (s_data_mutex != NULL && xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(ADS1115_I2C_TIMEOUT_MS)) == pdTRUE) {
+        memcpy(&copy, &latest_sensor_data, sizeof(latest_sensor_data));
+        xSemaphoreGive(s_data_mutex);
+    }
+
+    return copy;
 }
 
 /**
@@ -386,11 +406,16 @@ void ads1115_deinit(void)
 {
     ESP_LOGI(TAG, "Деинициализация ADS1115 для OTA...");
 
-    // Освобождаем мьютекс
+    // Освобождаем мьютексы
     if (ads1115_mutex != NULL) {
         vSemaphoreDelete(ads1115_mutex);
         ads1115_mutex = NULL;
-        ESP_LOGI(TAG, "Мьютекс ADS1115 удалён");
+        ESP_LOGI(TAG, "Мьютекс I2C ADS1115 удалён");
+    }
+    if (s_data_mutex != NULL) {
+        vSemaphoreDelete(s_data_mutex);
+        s_data_mutex = NULL;
+        ESP_LOGI(TAG, "Мьютекс данных ADS1115 удалён");
     }
 
     // Освобождаем ресурсы I2C устройства
@@ -429,10 +454,14 @@ void ads1115_reset(void)
 {
     ESP_LOGI(TAG, "Сброс состояния ADS1115...");
 
-    // Освобождаем мьютекс если существует
+    // Освобождаем мьютексы если существуют
     if (ads1115_mutex != NULL) {
         vSemaphoreDelete(ads1115_mutex);
         ads1115_mutex = NULL;
+    }
+    if (s_data_mutex != NULL) {
+        vSemaphoreDelete(s_data_mutex);
+        s_data_mutex = NULL;
     }
 
     ads1115_initialized = false;

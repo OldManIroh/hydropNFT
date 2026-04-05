@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -24,8 +25,8 @@
 /// Тег для системы логирования
 static const char *TAG = "sntp_client";
 
-/// Флаг состояния синхронизации времени
-static bool s_time_synced = false;
+/// Флаг состояния синхронизации времени (atomic — пишется из callback, читается из задач)
+static _Atomic bool s_time_synced = false;
 
 /**
  * @brief Callback функция уведомления о синхронизации времени
@@ -37,8 +38,6 @@ static bool s_time_synced = false;
  */
 void time_sync_notification_cb(struct timeval *tv)
 {
-    ESP_LOGI(TAG, "Получено время с NTP сервера");
-
     // Получаем текущее время для форматирования
     time_t now;
     struct tm timeinfo;
@@ -49,7 +48,9 @@ void time_sync_notification_cb(struct timeval *tv)
     char strftime_buf[64];
     strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
-    ESP_LOGI(TAG, "Текущее время: %s", strftime_buf);
+    // ESP_LOGI — чтобы log_forwarder НЕ отправлял в MQTT (только W и E)
+    // Публикация в MQTT в момент SNTP sync может повредить сетевой стек
+    ESP_LOGI(TAG, "SNTP синхронизировано: %s", strftime_buf);
 
     // Устанавливаем флаг синхронизации
     s_time_synced = true;
@@ -72,9 +73,6 @@ void sntp_client_init(void)
 
     // Настраиваем NTP серверы из Kconfig (в порядке приоритета)
     config.servers[0] = CONFIG_SNTP_SERVER_1;
-    config.servers[1] = CONFIG_SNTP_SERVER_2;
-    config.servers[2] = CONFIG_SNTP_SERVER_3;
-    config.servers[3] = CONFIG_SNTP_SERVER_4;
 
     // Устанавливаем callback для уведомления о синхронизации
     config.sync_cb = time_sync_notification_cb;

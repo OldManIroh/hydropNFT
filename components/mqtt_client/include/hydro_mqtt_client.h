@@ -234,6 +234,20 @@ void *mqtt_client_get_handle(void);
  */
 void mqtt_client_publish_mac_address(void);
 
+/**
+ * @brief Публикация состояния touch-сигнала в MQTT
+ *
+ * Отправляет состояние touch-датчика (полученное по ESP-NOW)
+ * в топик hydro/control/touch.
+ *
+ * @param state true = касание (верхний уровень), false = нет касания (нижний уровень)
+ *
+ * @note Топик: hydro/control/touch
+ * @note Формат: "true" или "false"
+ * @note QoS=0, retain=0
+ */
+void mqtt_client_publish_touch_state(bool state);
+
 #ifdef __cplusplus
 }
 #endif

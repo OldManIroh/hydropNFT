@@ -30,7 +30,7 @@
 #include "hydro_mqtt_client.h"     // Локальный заголовочный файл компонента
 #include "esp_ota_ops.h"           // Для получения версии прошивки
 #include "esp_mac.h"               // Для получения MAC адреса
-#include "main.h"                  // Для функций управления GPIO и получения данных DHT
+#include "device_control.h"        // Для функций управления GPIO и получения данных DHT
 #include "ads1115.h"               // Для получения данных с ADS1115
 
 /// Тег для системы логирования ESP-IDF
@@ -49,11 +49,12 @@ static _Atomic bool mqtt_connected = false;
 /// Используется в main.c для запуска процесса обновления прошивки
 static _Atomic bool ota_update_requested = false;
 
-/// @brief Состояния выключателей
+/// @brief Состояния выключателей — используются только для отслеживания MQTT-команд
+/// Реальное состояние GPIO читается через device_control_get_*_state()
 /// @{
-static _Atomic bool pump_state = false;   ///< Насос циркуляции - выключен по умолчанию
-static _Atomic bool light_state = false;  ///< Фитолампа - выключена по умолчанию
-static _Atomic bool valve_state = false;  ///< Клапан - выключен по умолчанию
+static _Atomic bool pump_state = false;   ///< Отражение состояния насоса из MQTT
+static _Atomic bool light_state = false;  ///< Отражение состояния света из MQTT
+static _Atomic bool valve_state = false;  ///< Отражение состояния клапана из MQTT
 /// @}
 
 
@@ -156,16 +157,14 @@ static void send_discovery_switch(esp_mqtt_client_handle_t client, const char *o
     char topic[128];
     char payload[1024];
 
-    // Топик конфигурации выключателя
     snprintf(topic, sizeof(topic), "homeassistant/switch/hydroesp32/%s/config", object_id);
     
-    // JSON конфигурации выключателя
     snprintf(payload, sizeof(payload),
              "{\"name\":\"%s\","
-             "\"command_topic\":\"%s\","    // Топик для команд
-             "\"state_topic\":\"%s\","      // Топик для состояния
-             "\"payload_on\":\"ON\","       // Команда включения
-             "\"payload_off\":\"OFF\","     // Команда выключения
+             "\"command_topic\":\"%s\","
+             "\"state_topic\":\"%s\","
+             "\"payload_on\":\"ON\","
+             "\"payload_off\":\"OFF\","
              "\"unique_id\":\"esp32_hydro_%s\","
              "\"device\":{"
              "\"identifiers\":[\"esp32_hydro_controller\"],"
@@ -177,6 +176,46 @@ static void send_discovery_switch(esp_mqtt_client_handle_t client, const char *o
 
     int msg_id = esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
     ESP_LOGI(TAG, "Switch discovery sent for %s, msg_id=%d", object_id, msg_id);
+}
+
+/**
+ * @brief Отправка конфигурации селектора режима для Home Assistant Discovery
+ *
+ * Селекторы (select) используются для переключения режимов AUTO/MANUAL.
+ *
+ * @param client Дескриптор MQTT клиента
+ * @param object_id Уникальный идентификатор (например: "pump_mode")
+ * @param name Отображаемое имя в HA
+ * @param command_topic Топик для получения команд
+ * @param state_topic Топик для отправки состояния
+ *
+ * @note Опции: "auto", "manual"
+ */
+static void send_discovery_select(esp_mqtt_client_handle_t client, const char *object_id,
+                                  const char *name, const char *command_topic, const char *state_topic)
+{
+    char topic[128];
+    char payload[1024];
+
+    snprintf(topic, sizeof(topic), "homeassistant/select/hydroesp32/%s/config", object_id);
+
+    snprintf(payload, sizeof(payload),
+             "{\"name\":\"%s\","
+             "\"command_topic\":\"%s\","
+             "\"state_topic\":\"%s\","
+             "\"options\":[\"auto\",\"manual\"],"
+             "\"unique_id\":\"esp32_hydro_%s\","
+             "\"icon\":\"mdi:cog\","
+             "\"device\":{"
+             "\"identifiers\":[\"esp32_hydro_controller\"],"
+             "\"name\":\"Hydroponic system\","
+             "\"model\":\"ESP32\","
+             "\"manufacturer\":\"HydroNFT\""
+             "}}",
+             name, command_topic, state_topic, object_id);
+
+    int msg_id = esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "Select discovery sent for %s, msg_id=%d", object_id, msg_id);
 }
 
 /**
@@ -360,6 +399,21 @@ static void publish_switch_state(const char *state_topic, bool state)
 }
 
 // ============================================================================
+// CALLBACK ИЗМЕНЕНИЯ СОСТОЯНИЯ GPIO
+// ============================================================================
+
+/**
+ * @brief Callback для публикации состояния GPIO в MQTT
+ * Вызывается из device_control при каждом изменении gpio_set_level().
+ */
+static void on_device_state_changed(const char *topic, bool state)
+{
+    if (mqtt_connected && mqtt_client) {
+        publish_switch_state(topic, state);
+    }
+}
+
+// ============================================================================
 // ОБРАБОТЧИК СОБЫТИЙ MQTT
 // ============================================================================
 
@@ -412,42 +466,67 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             send_discovery_sensor(mqtt_client, "temperature", "Температура помещения", "°C", "temperature", "hydro/sensor/temperature/state");
 
             // === Выключатели ===
-            // 7. Насос циркуляции
             send_discovery_switch(mqtt_client, "pump", "Насос циркуляции",
                                   "hydro/switch/pump/set", "hydro/switch/pump/state");
-            // 8. Фитолампа
             send_discovery_switch(mqtt_client, "light", "Фитолампа",
                                   "hydro/switch/light/set", "hydro/switch/light/state");
-            // 9. Клапан воды
             send_discovery_switch(mqtt_client, "valve", "Клапан воды",
                                   "hydro/switch/valve/set", "hydro/switch/valve/state");
 
+            // === Селектор режима (AUTO/MANUAL) — общий для всех устройств ===
+            send_discovery_select(mqtt_client, "system_mode", "Режим системы",
+                                  "hydro/switch/mode/set", "hydro/switch/mode/state");
+
             // === Диагностика ===
-            // 10. Версия прошивки
             send_discovery_firmware_version(mqtt_client);
-            // 11. Статус обновления
             send_discovery_ota_status(mqtt_client);
-            // 12. Прогресс обновления
             send_discovery_ota_progress(mqtt_client);
-            // 13. Кнопка обновления прошивки
             send_discovery_button(mqtt_client, "ota_update", "Обновление прошивки",
                                   "hydro/ota/update", "START");
-            // 14. MAC адрес устройства
             send_discovery_mac_address(mqtt_client);
 
-            // Подписываемся на топики команд
-            // QoS=1 гарантирует доставку сообщений
+            // === Touch-сенсор (верхний уровень воды) ===
+            {
+                char topic[128];
+                char payload[512];
+                snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/hydroesp32/touch/config");
+                snprintf(payload, sizeof(payload),
+                         "{\"name\":\"Верхний уровень воды\","
+                         "\"state_topic\":\"hydro/control/touch\","
+                         "\"payload_on\":\"true\","
+                         "\"payload_off\":\"false\","
+                         "\"unique_id\":\"esp32_hydro_touch\","
+                         "\"device_class\":\"moisture\","
+                         "\"device\":{"
+                         "\"identifiers\":[\"esp32_hydro_controller\"],"
+                         "\"name\":\"Hydroponic system\","
+                         "\"model\":\"ESP32\","
+                         "\"manufacturer\":\"HydroNFT\""
+                         "}}");
+                esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
+                ESP_LOGI(TAG, "Touch sensor discovery sent");
+            }
+
+            // Подписываемся на топики команд (QoS=1)
             esp_mqtt_client_subscribe(mqtt_client, "hydro/switch/pump/set", 1);
             esp_mqtt_client_subscribe(mqtt_client, "hydro/switch/light/set", 1);
             esp_mqtt_client_subscribe(mqtt_client, "hydro/switch/valve/set", 1);
-
-            // Подписка на топик OTA обновлений
+            esp_mqtt_client_subscribe(mqtt_client, "hydro/switch/mode/set", 1);
             esp_mqtt_client_subscribe(mqtt_client, "hydro/ota/update", 1);
 
-            // Публикуем текущее состояние выключателей для синхронизации с HA
-            publish_switch_state("hydro/switch/pump/state", pump_state);
-            publish_switch_state("hydro/switch/light/state", light_state);
-            publish_switch_state("hydro/switch/valve/state", valve_state);
+            // Публикуем текущий режим работы
+            {
+                const char *mode_str = device_control_mode_to_string(device_control_get_mode());
+                esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", mode_str, 0, 1, 0);
+            }
+
+            // Регистрируем callback для автоматической публикации состояния GPIO
+            device_control_register_state_cb(on_device_state_changed);
+
+            // Публикуем текущее состояние выключателей (callback не вызовется т.к. GPIO не меняется)
+            publish_switch_state("hydro/switch/pump/state", device_control_get_pump_state());
+            publish_switch_state("hydro/switch/light/state", device_control_get_light_state());
+            publish_switch_state("hydro/switch/valve/state", device_control_get_valve_state());
 
             // Публикуем статус OTA
             mqtt_client_publish_ota_status("idle");
@@ -495,17 +574,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // -------------------------------------------------------------
             if (strcmp(topic, "hydro/switch/pump/set") == 0) {
                 if (strcmp(data, "ON") == 0) {
-                    pump_state = true;
-                    ESP_LOGI(TAG, "Pump: ON (ручное управление)");
-                    // Включаем насос через GPIO (ручное управление на 5 минут)
-                    set_pump_state(true, true);
+                    atomic_store(&pump_state, true);
+                    ESP_LOGI(TAG, "Pump: ON");
+                    device_control_set_pump_state(true);
+                    device_control_set_mode(DEVICE_MODE_MANUAL);
+                    esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", "manual", 0, 1, 0);
+                    device_control_notify_mode_changed();
                 } else if (strcmp(data, "OFF") == 0) {
-                    pump_state = false;
-                    ESP_LOGI(TAG, "Pump: OFF (ручное управление)");
-                    set_pump_state(false, true);
+                    atomic_store(&pump_state, false);
+                    ESP_LOGI(TAG, "Pump: OFF");
+                    device_control_set_pump_state(false);
+                    device_control_set_mode(DEVICE_MODE_MANUAL);
+                    esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", "manual", 0, 1, 0);
+                    device_control_notify_mode_changed();
                 }
-                // Отправляем подтверждение состояния обратно в HA
-                publish_switch_state("hydro/switch/pump/state", pump_state);
             }
 
             // -------------------------------------------------------------
@@ -515,15 +597,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // -------------------------------------------------------------
             else if (strcmp(topic, "hydro/switch/light/set") == 0) {
                 if (strcmp(data, "ON") == 0) {
-                    light_state = true;
-                    ESP_LOGI(TAG, "Light: ON (ручное управление)");
-                    set_light_state(true, true);  // true = ручное управление
+                    atomic_store(&light_state, true);
+                    ESP_LOGI(TAG, "Light: ON");
+                    device_control_set_light_state(true);
+                    device_control_set_mode(DEVICE_MODE_MANUAL);
+                    esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", "manual", 0, 1, 0);
+                    device_control_notify_mode_changed();
                 } else if (strcmp(data, "OFF") == 0) {
-                    light_state = false;
-                    ESP_LOGI(TAG, "Light: OFF (ручное управление)");
-                    set_light_state(false, true);  // true = ручное управление
+                    atomic_store(&light_state, false);
+                    ESP_LOGI(TAG, "Light: OFF");
+                    device_control_set_light_state(false);
+                    device_control_set_mode(DEVICE_MODE_MANUAL);
+                    esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", "manual", 0, 1, 0);
+                    device_control_notify_mode_changed();
                 }
-                publish_switch_state("hydro/switch/light/state", light_state);
             }
 
             // -------------------------------------------------------------
@@ -533,15 +620,33 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // -------------------------------------------------------------
             else if (strcmp(topic, "hydro/switch/valve/set") == 0) {
                 if (strcmp(data, "ON") == 0) {
-                    valve_state = true;
-                    ESP_LOGI(TAG, "Valve: ON (ручное управление)");
-                    set_valve_state(true, true);  // Открываем клапан (ручное управление на 5 минут)
+                    atomic_store(&valve_state, true);
+                    ESP_LOGI(TAG, "Valve: ON");
+                    device_control_set_valve_state(true);
+                    device_control_set_mode(DEVICE_MODE_MANUAL);
+                    esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", "manual", 0, 1, 0);
+                    device_control_notify_mode_changed();
                 } else if (strcmp(data, "OFF") == 0) {
-                    valve_state = false;
-                    ESP_LOGI(TAG, "Valve: OFF (ручное управление)");
-                    set_valve_state(false, true);  // Закрываем клапан (ручное управление на 5 минут)
+                    atomic_store(&valve_state, false);
+                    ESP_LOGI(TAG, "Valve: OFF");
+                    device_control_set_valve_state(false);
+                    device_control_set_mode(DEVICE_MODE_MANUAL);
+                    esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", "manual", 0, 1, 0);
+                    device_control_notify_mode_changed();
                 }
-                publish_switch_state("hydro/switch/valve/state", valve_state);
+            }
+
+            // -------------------------------------------------------------
+            // Обработка команды режима системы (AUTO/MANUAL)
+            // Топик: hydro/switch/mode/set
+            // Данные: "auto" или "manual"
+            // -------------------------------------------------------------
+            else if (strcmp(topic, "hydro/switch/mode/set") == 0) {
+                device_mode_t mode = device_control_mode_from_string(data);
+                device_control_set_mode(mode);
+                esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", data, 0, 1, 0);
+                device_control_notify_mode_changed();
+                ESP_LOGI(TAG, "System mode: %s", data);
             }
 
             // -------------------------------------------------------------
@@ -551,9 +656,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // -------------------------------------------------------------
             else if (strcmp(topic, "hydro/ota/update") == 0) {
                 if (strcmp(data, "START") == 0) {
-                    ota_update_requested = true;  // Устанавливаем флаг для main.c
+                    ota_update_requested = true;
+                    device_control_notify_ota_flag();
                     ESP_LOGI(TAG, "Получена команда OTA START!");
-                    mqtt_client_publish_ota_status("started");  // Сообщаем о начале
+                    mqtt_client_publish_ota_status("started");
                 }
             }
             break;
@@ -600,19 +706,23 @@ void mqtt_client_init(void)
 {
     ESP_LOGI(TAG, "Initializing MQTT client");
 
+    // Даём сети стабилизироваться после получения IP
+    ESP_LOGI(TAG, "Ожидание стабилизации сети (2 сек)...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
     // Конфигурация MQTT клиента (учётные данные из Kconfig)
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = CONFIG_MQTT_BROKER_URI,           // Адрес брокера из menuconfig
-        .credentials.username = CONFIG_MQTT_USERNAME,           // Имя пользователя из menuconfig
-        .credentials.authentication.password = CONFIG_MQTT_PASSWORD,  // Пароль из menuconfig
+        .broker.address.uri = CONFIG_MQTT_BROKER_URI,
+        .credentials.username = CONFIG_MQTT_USERNAME,
+        .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
     };
 
     // Инициализация клиента
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    
+
     // Регистрация обработчика событий на все события (ESP_EVENT_ANY_ID)
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    
+
     // Запуск клиента (начнётся подключение к брокеру)
     esp_mqtt_client_start(mqtt_client);
 }
@@ -693,46 +803,52 @@ void mqtt_client_publish_ota_status(const char *status)
  */
 void mqtt_client_publish_sensor_data(void)
 {
-    if (mqtt_connected && mqtt_client) {
-        char msg[64];  // Буфер для строкового представления значения
+    if (!mqtt_connected || !mqtt_client) {
+        ESP_LOGW(TAG, "Публикация сенсоров пропущена: connected=%d, client=%p", mqtt_connected, (void *)mqtt_client);
+        return;
+    }
 
-        const ads1115_sensor_data_t *sensor_data = ads1115_get_latest_data();
+    char msg[64];
+    ads1115_sensor_data_t sensor_data = ads1115_get_latest_data();
 
-        if (sensor_data->valid) {
-            // Публикация напряжения pH датчика (канал 0)
-            snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[0]);
-            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/ph/state", msg, 0, 0, 0);
+    if (sensor_data.valid) {
+        // Публикация напряжения pH датчика (канал 0)
+        snprintf(msg, sizeof(msg), "%.4f", sensor_data.voltage[0]);
+        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/ph/state", msg, 0, 0, 0);
 
-            // Публикация TDS датчика (канал 2) - преобразование из напряжения в ppm
-            // 0-TDS_MAX_VOLTAGE_V = 0-1000 ppm
-            float tds_ppm = (sensor_data->voltage[2] / TDS_MAX_VOLTAGE_V) * 1000.0f;
-            if (tds_ppm < 0.0f) tds_ppm = 0.0f;
-            if (tds_ppm > 1000.0f) tds_ppm = 1000.0f;
-            snprintf(msg, sizeof(msg), "%.0f", tds_ppm);
-            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/tds/state", msg, 0, 0, 0);
+        // Публикация TDS датчика (канал 2) - преобразование из напряжения в ppm
+        // 0-TDS_MAX_VOLTAGE_V = 0-1000 ppm
+        float tds_ppm = (sensor_data.voltage[2] / TDS_MAX_VOLTAGE_V) * 1000.0f;
+        if (tds_ppm < 0.0f) tds_ppm = 0.0f;
+        if (tds_ppm > 1000.0f) tds_ppm = 1000.0f;
+        snprintf(msg, sizeof(msg), "%.0f", tds_ppm);
+        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/tds/state", msg, 0, 0, 0);
 
-            // Публикация напряжения датчика уровня воды (канал 3)
-            snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[3]);
-            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/level/state", msg, 0, 0, 0);
+        // Публикация напряжения датчика уровня воды (канал 3)
+        snprintf(msg, sizeof(msg), "%.4f", sensor_data.voltage[3]);
+        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/level/state", msg, 0, 0, 0);
 
-            // Публикация напряжения датчика температуры воды (канал 1)
-            snprintf(msg, sizeof(msg), "%.4f", sensor_data->voltage[1]);
-            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/water_temp/state", msg, 0, 0, 0);
-        }
+        // Публикация напряжения датчика температуры воды (канал 1)
+        snprintf(msg, sizeof(msg), "%.4f", sensor_data.voltage[1]);
+        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/water_temp/state", msg, 0, 0, 0);
+    } else {
+        ESP_LOGW(TAG, "ADS1115 данные не валидны, публикация пропущена");
+    }
 
-        // Публикация данных DHT (температура и влажность)
-        if (is_dht_data_valid()) {
-            float temp = get_dht_temperature();
-            float hum = get_dht_humidity();
+    // Публикация данных DHT (температура и влажность)
+    if (device_control_is_dht_data_valid()) {
+        float temp = device_control_get_dht_temperature();
+        float hum = device_control_get_dht_humidity();
 
-            // Температура
-            snprintf(msg, sizeof(msg), "%.1f", temp);
-            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/temperature/state", msg, 0, 0, 0);
+        // Температура
+        snprintf(msg, sizeof(msg), "%.1f", temp);
+        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/temperature/state", msg, 0, 0, 0);
 
-            // Влажность
-            snprintf(msg, sizeof(msg), "%.1f", hum);
-            esp_mqtt_client_publish(mqtt_client, "hydro/sensor/humidity/state", msg, 0, 0, 0);
-        }
+        // Влажность
+        snprintf(msg, sizeof(msg), "%.1f", hum);
+        esp_mqtt_client_publish(mqtt_client, "hydro/sensor/humidity/state", msg, 0, 0, 0);
+    } else {
+        ESP_LOGW(TAG, "DHT данные не валидны, публикация пропущена");
     }
 }
 
@@ -804,16 +920,23 @@ void mqtt_client_publish_mac_address(void)
         uint8_t mac_addr[6];
         char mac_str[18];
         
-        // Получаем MAC адрес устройства
         esp_read_mac(mac_addr, ESP_MAC_WIFI_STA);
         
-        // Форматируем MAC адрес в строку
         snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
                  mac_addr[0], mac_addr[1], mac_addr[2],
                  mac_addr[3], mac_addr[4], mac_addr[5]);
         
         esp_mqtt_client_publish(mqtt_client, "hydro/system/mac_address", mac_str, 0, 1, 1);
         ESP_LOGI(TAG, "Published MAC address: %s", mac_str);
+    }
+}
+
+void mqtt_client_publish_touch_state(bool state)
+{
+    if (mqtt_connected && mqtt_client) {
+        const char *payload = state ? "true" : "false";
+        esp_mqtt_client_publish(mqtt_client, "hydro/control/touch", payload, 0, 0, 0);
+        ESP_LOGI(TAG, "Опубликовано состояние touch: %s", payload);
     }
 }
 // /**
