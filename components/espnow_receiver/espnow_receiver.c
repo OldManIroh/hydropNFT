@@ -50,9 +50,12 @@ static _Atomic bool s_touch_state = false;
 /// Флаг изменения состояния (сигнал для задачи)
 static _Atomic bool s_state_changed = false;
 
+/// Флаг ожидающей публикации: не восстанавливаем s_state_changed при отключённом MQTT,
+/// чтобы избежать лавины логов. Публикуем при следующей возможности.
+static _Atomic bool s_pending_publish = false;
+
 /// MAC-адрес последнего отправителя (для отладки)
-/// @note Записывается в ISR, читается в задаче — без синхронизации.
-///       Допустимо т.к. используется только для логирования.
+/// @note Используется только для логирования — stale значения допустимы
 static uint8_t s_last_sender_mac[6] = {0};
 
 /// Счётчик принятых пакетов
@@ -68,7 +71,7 @@ static _Atomic uint32_t s_crc_errors = 0;
 /**
  * @brief Callback приёма ESP-NOW данных
  *
- * Вызывается в контексте прерывания Wi-Fi. Валидирует CRC пакета,
+ * Вызывается в контексте задачи Wi-Fi (не ISR). Валидирует CRC пакета,
  * извлекает состояние и сохраняет в _Atomic bool.
  */
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len)
@@ -95,7 +98,9 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         return;
     }
 
-    // Сохраняем MAC-адрес отправителя
+    // Сохраняем MAC-адрес отправителя (только для отладки)
+    // ПРИМЕЧАНИЕ: memcpy 6 байт не атомарен — возможен torn read при одновременном
+    // чтении из espnow_receiver_task(). Для отладочных целей это допустимо.
     if (recv_info->src_addr != NULL) {
         memcpy(s_last_sender_mac, recv_info->src_addr, 6);
     }
@@ -191,28 +196,53 @@ void espnow_receiver_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Задача ESP-NOW receiver запущена");
 
+    bool last_published_state = false;  // Дедупликация состояний
+
     while (1) {
         // Проверяем было ли изменение состояния
         if (atomic_exchange(&s_state_changed, false)) {
             bool current_state = atomic_load(&s_touch_state);
 
-            // Формируем строку MAC-адреса для логирования
-            char mac_str[18];
-            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                     s_last_sender_mac[0], s_last_sender_mac[1], s_last_sender_mac[2],
-                     s_last_sender_mac[3], s_last_sender_mac[4], s_last_sender_mac[5]);
+            // Публикуем только если состояние реально изменилось
+            if (current_state != last_published_state) {
+                // Копируем MAC-адрес (только для логирования — допустимо получить stale значение)
+                uint8_t local_mac[6];
+                memcpy(local_mac, s_last_sender_mac, 6);
 
-            ESP_LOGI(TAG, "ESP-NOW: touch=%s (от %s) [принято=%u, CRC ошибок=%u]",
-                     current_state ? "true" : "false", mac_str,
-                     atomic_load(&s_packet_count), atomic_load(&s_crc_errors));
+                // Формируем строку MAC-адреса для логирования
+                char mac_str[18];
+                snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         local_mac[0], local_mac[1], local_mac[2],
+                         local_mac[3], local_mac[4], local_mac[5]);
 
-            // Публикуем в MQTT если подключены
-            if (mqtt_client_is_connected()) {
-                mqtt_client_publish_touch_state(current_state);
-            } else {
-                ESP_LOGW(TAG, "MQTT не подключён, состояние touch=%s не опубликовано",
-                         current_state ? "true" : "false");
+                ESP_LOGI(TAG, "ESP-NOW: touch=%s (от %s) [принято=%u, CRC ошибок=%u]",
+                         current_state ? "true" : "false", mac_str,
+                         atomic_load(&s_packet_count), atomic_load(&s_crc_errors));
+
+                // Публикуем в MQTT если подключены
+                if (mqtt_client_is_connected()) {
+                    mqtt_client_publish_touch_state(current_state);
+                    atomic_store(&s_pending_publish, false);  // Успешно — сбрасываем pending
+                    last_published_state = current_state;
+                } else {
+                    // Не восстанавливаем s_state_changed — это вызывало лавину логов.
+                    // Вместо этого ставим флаг pending и публикуем при восстановлении MQTT.
+                    if (!atomic_load(&s_pending_publish)) {
+                        atomic_store(&s_pending_publish, true);
+                        ESP_LOGW(TAG, "MQTT не подключён, touch=%s ожидает публикации",
+                                 current_state ? "true" : "false");
+                    }
+                }
             }
+        }
+
+        // Публикуем отложенное состояние как только MQTT восстановится
+        if (atomic_load(&s_pending_publish) && mqtt_client_is_connected()) {
+            bool pending_state = atomic_load(&s_touch_state);
+            mqtt_client_publish_touch_state(pending_state);
+            atomic_store(&s_pending_publish, false);
+            ESP_LOGI(TAG, "ESP-NOW: отложенная публикация touch=%s выполнена",
+                     pending_state ? "true" : "false");
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));

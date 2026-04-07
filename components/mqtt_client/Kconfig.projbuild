@@ -1,46 +1,30 @@
-menu "Example Configuration"
+menu "Настройки MQTT"
 
     config MQTT_BROKER_URI
-        string "MQTT Broker URI"
+        string "URI брокера"
         default "mqtt://192.168.0.107:1883"
         help
-            URI of the MQTT broker to connect to.
-            Example: mqtt://192.168.0.107:1883 or mqtts://broker.example.com:8883
+            Адрес MQTT брокера для подключения.
+            Примеры: mqtt://192.168.0.107:1883, mqtts://broker.example.com:8883
 
     config MQTT_USERNAME
-        string "MQTT Username"
+        string "Имя пользователя"
         default "hydroesp32"
         help
-            Username for MQTT authentication.
+            Имя пользователя для аутентификации на MQTT брокере.
 
     config MQTT_PASSWORD
-        string "MQTT Password"
+        string "Пароль"
         default "asda"
         help
-            Password for MQTT authentication.
-            WARNING: This is stored in plain text in the configuration.
-            For production use, consider using NVS-based secure storage.
-
-    config BROKER_URL
-        string "Broker URL"
-        default "mqtt://mqtt.eclipseprojects.io"
-        help
-            URL of the broker to connect to
-
-    config BROKER_URL_FROM_STDIN
-        bool
-        default y if BROKER_URL = "FROM_STDIN"
+            Пароль для аутентификации на MQTT брокере.
+            Внимание: хранится в открытом виде в конфигурации.
 
     config LIGHT_ON_HOUR
-        int "Light ON hour"
+        int "Час включения света"
         default 8
+        range 0 23
         help
-            Hour of day (0-23) when to turn on the light.
-
-    config LIGHT_OFF_HOUR
-        int "Light OFF hour"
-        default 0
-        help
-            Hour of day (0-23) when to turn off the light.
+            Час (0–23), в который включается свет по расписанию.
 
 endmenu

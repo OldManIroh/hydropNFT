@@ -6,8 +6,8 @@
  * точного времени с публичных NTP серверов.
  *
  * @author HydroNFT Team
- * @version 1.0
- * @date 2024
+ * @version 2.0
+ * @date 2026
  */
 
 #include <stdio.h>
@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif_sntp.h"
+#include "hydro_mqtt_client.h"     // Для проверки MQTT подключения
 #include "sntp_client.h"
 
 /// Тег для системы логирования
@@ -48,12 +49,21 @@ void time_sync_notification_cb(struct timeval *tv)
     char strftime_buf[64];
     strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
-    // ESP_LOGI — чтобы log_forwarder НЕ отправлял в MQTT (только W и E)
-    // Публикация в MQTT в момент SNTP sync может повредить сетевой стек
+    // ESP_LOGI — только в UART терминал
     ESP_LOGI(TAG, "SNTP синхронизировано: %s", strftime_buf);
 
+    // Устанавливаем часовой пояс UTC+5 (Екатеринбург)
+    setenv("TZ", "MSK-5", 1);
+    tzset();
+
     // Устанавливаем флаг синхронизации
-    s_time_synced = true;
+    atomic_store(&s_time_synced, true);
+
+    // Публикуем время в MQTT через log_forwarder (ESP_LOGW → WARNING → MQTT)
+    // Если MQTT подключён — log_forwarder перешлёт; если нет — пропустит
+    if (mqtt_client_is_connected()) {
+        ESP_LOGW(TAG, "Локальное время (NTP синхронизировано): %s", strftime_buf);
+    }
 }
 
 /**
@@ -68,17 +78,48 @@ void sntp_client_init(void)
 {
     ESP_LOGI(TAG, "Инициализация SNTP клиента");
 
-    // Создаём конфигурацию SNTP с настройками по умолчанию
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG();
-
-    // Настраиваем NTP серверы из Kconfig (в порядке приоритета)
-    config.servers[0] = CONFIG_SNTP_SERVER_1;
+    // Инициализация SNTP с несколькими серверами для отказоустойчивости.
+    // Количество серверов задаётся в menuconfig → SNTP Client Configuration → Number of NTP servers.
+#if CONFIG_SNTP_SERVER_COUNT_4
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+        4, ESP_SNTP_SERVER_LIST(CONFIG_SNTP_SERVER_1, CONFIG_SNTP_SERVER_2,
+                                CONFIG_SNTP_SERVER_3, CONFIG_SNTP_SERVER_4));
+    ESP_LOGI(TAG, "SNTP: 4 сервера для отказоустойчивости");
+#elif CONFIG_SNTP_SERVER_COUNT_3
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+        3, ESP_SNTP_SERVER_LIST(CONFIG_SNTP_SERVER_1, CONFIG_SNTP_SERVER_2,
+                                CONFIG_SNTP_SERVER_3));
+    ESP_LOGI(TAG, "SNTP: 3 сервера для отказоустойчивости");
+#elif CONFIG_SNTP_SERVER_COUNT_2
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+        2, ESP_SNTP_SERVER_LIST(CONFIG_SNTP_SERVER_1, CONFIG_SNTP_SERVER_2));
+    ESP_LOGI(TAG, "SNTP: 2 сервера для отказоустойчивости");
+#else
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(CONFIG_SNTP_SERVER_1);
+    ESP_LOGI(TAG, "SNTP: 1 сервер");
+#endif
 
     // Устанавливаем callback для уведомления о синхронизации
     config.sync_cb = time_sync_notification_cb;
 
     // Инициализируем SNTP с конфигурацией
-    esp_netif_sntp_init(&config);
+    esp_err_t ret = esp_netif_sntp_init(&config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка инициализации SNTP: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    // Если LWIP_MAX_SERVERS меньше выбранного — часть серверов будет проигнорирована
+#if CONFIG_SNTP_SERVER_COUNT_4 && CONFIG_LWIP_SNTP_MAX_SERVERS < 4
+    ESP_LOGW(TAG, "CONFIG_LWIP_SNTP_MAX_SERVERS=%d < 4 — увеличьте в menuconfig → LWIP → SNTP",
+             CONFIG_LWIP_SNTP_MAX_SERVERS);
+#elif CONFIG_SNTP_SERVER_COUNT_3 && CONFIG_LWIP_SNTP_MAX_SERVERS < 3
+    ESP_LOGW(TAG, "CONFIG_LWIP_SNTP_MAX_SERVERS=%d < 3 — увеличьте в menuconfig → LWIP → SNTP",
+             CONFIG_LWIP_SNTP_MAX_SERVERS);
+#elif CONFIG_SNTP_SERVER_COUNT_2 && CONFIG_LWIP_SNTP_MAX_SERVERS < 2
+    ESP_LOGW(TAG, "CONFIG_LWIP_SNTP_MAX_SERVERS=%d < 2 — увеличьте в menuconfig → LWIP → SNTP",
+             CONFIG_LWIP_SNTP_MAX_SERVERS);
+#endif
 
     ESP_LOGI(TAG, "SNTP запущен, ожидание синхронизации...");
 }
@@ -100,19 +141,29 @@ bool sntp_time_sync(void)
 
     int retry = 0;
     const int retry_count = CONFIG_SNTP_SYNC_RETRY_COUNT;
+    esp_err_t sync_result;
 
-    while (esp_netif_sntp_sync_wait(5000 / portTICK_PERIOD_MS) == ESP_ERR_TIMEOUT &&
+    while ((sync_result = esp_netif_sntp_sync_wait(5000 / portTICK_PERIOD_MS)) == ESP_ERR_TIMEOUT &&
            ++retry < retry_count) {
         ESP_LOGI(TAG, "Ожидание синхронизации NTP... (%d/%d)", retry, retry_count);
     }
 
-    if (retry < retry_count) {
-        ESP_LOGI(TAG, "Время успешно синхронизировано");
-        return true;
-    } else {
-        ESP_LOGE(TAG, "Не удалось синхронизировать время");
+    // Проверяем результат — не только TIMEOUT, но и другие ошибки
+    if (sync_result != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка синхронизации SNTP: %s (%d попыток)",
+                 esp_err_to_name(sync_result), retry_count);
+        atomic_store(&s_time_synced, false);
         return false;
     }
+
+    if (retry >= retry_count) {
+        ESP_LOGE(TAG, "Не удалось синхронизировать время после %d попыток", retry_count);
+        atomic_store(&s_time_synced, false);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Время успешно синхронизировано");
+    return true;
 }
 
 /**
@@ -120,7 +171,7 @@ bool sntp_time_sync(void)
  */
 bool sntp_client_is_synced(void)
 {
-    return s_time_synced;
+    return atomic_load(&s_time_synced);
 }
 
 /**
@@ -128,7 +179,7 @@ bool sntp_client_is_synced(void)
  */
 bool sntp_client_get_time_string(char *buffer, size_t buffer_size)
 {
-    if (!s_time_synced) {
+    if (!atomic_load(&s_time_synced)) {
         return false;
     }
     
@@ -150,7 +201,7 @@ bool sntp_client_get_time_string(char *buffer, size_t buffer_size)
  */
 time_t sntp_client_get_timestamp(void)
 {
-    if (!s_time_synced) {
+    if (!atomic_load(&s_time_synced)) {
         return 0;
     }
     

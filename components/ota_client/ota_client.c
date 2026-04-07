@@ -6,6 +6,7 @@
 
 #include <string.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -36,12 +37,11 @@
 #define OTA_URL_SIZE 256
 
 static const char *TAG = "ota_client";
-static char ota_write_data[BUFFSIZE + 1] = {0};
 
 // Переменные для отслеживания прогресса OTA
-static int s_ota_downloaded_bytes = 0;     ///< Количество загруженных байт
-static int s_ota_total_bytes = 0;          ///< Общий размер файла
-static bool s_ota_active = false;          ///< Флаг активной OTA сессии
+static _Atomic int s_ota_downloaded_bytes = 0;     ///< Количество загруженных байт
+static _Atomic int s_ota_total_bytes = 0;          ///< Общий размер файла
+static _Atomic bool s_ota_active = false;          ///< Флаг активной OTA сессии
 
 extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
@@ -53,45 +53,66 @@ static void http_cleanup(esp_http_client_handle_t client)
 }
 
 /**
+ * @brief Вспомогательная функция перезагрузки с задержкой
+ *
+ * Используется при фатальных и нефатальных ошибках OTA.
+ * Публикует статус (если указан), ждёт 5 секунд, удаляет задачу
+ * из TWDT и перезагружает устройство.
+ *
+ * @param ota_status Строка статуса для MQTT или NULL (не публиковать)
+ *
+ * @note Вызывающая сторона должна залогировать причину перезагрузки ДО вызова
+ */
+static void ota_restart_helper(const char *ota_status)
+{
+    if (ota_status) {
+        mqtt_client_publish_ota_status(ota_status);
+    }
+    ESP_LOGW(TAG, "Перезагрузка через 5 секунд...");
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    esp_task_wdt_delete(NULL);
+    esp_restart();
+    // На случай если esp_restart() не сработал
+    while (1) { vTaskDelay(1); }
+}
+
+/**
  * @brief Обработчик фатальных ошибок — перезагружает устройство
- * 
+ *
  * Вызывается при критических ошибках OTA:
  * - Ошибка сети/SSL
  * - Ошибка записи во flash
  * - Повреждение данных
- * 
- * Перед перезагрузкой:
- * 1. Публикует статус ошибки в MQTT
- * 2. Ждёт 5 секунд (чтобы сообщение дошло до брокера)
- * 3. Перезагружает устройство
- * 
+ *
+ * Перед перезагрузкой публикует статус ошибки в MQTT.
+ *
  * @note Функция не возвращает управление - устройство будет перезапущено
  */
 static void task_fatal_error(void)
 {
     ESP_LOGE(TAG, "Фатальная ошибка OTA - перезагрузка устройства...");
-    
-    // Публикуем статус фатальной ошибки
-    mqtt_client_publish_ota_status("fatal_error");
-    
-    // Даём 5 секунд на доставку MQTT сообщения
-    ESP_LOGW(TAG, "Перезагрузка через 5 секунд...");
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
-    
-    // Перезагружаем устройство
-    esp_restart();
-    
-    // На случай если esp_restart() не сработал
-    while (1) { ; }
+    ota_restart_helper("fatal_error");
+}
+
+/**
+ * @brief Перезагрузка при ошибке OTA (не фатальная)
+ *
+ * Вызывается при незавершённой загрузке или ошибке валидации.
+ */
+static void ota_restart_with_delay(void)
+{
+    ota_restart_helper(NULL);
 }
 
 static void print_sha256(const uint8_t *image_hash, const char *label)
 {
     char hash_print[HASH_LEN * 2 + 1];
-    hash_print[HASH_LEN * 2] = 0;
+    static const char hex[] = "0123456789abcdef";
     for (int i = 0; i < HASH_LEN; ++i) {
-        sprintf(&hash_print[i * 2], "%02x", image_hash[i]);
+        hash_print[i * 2]     = hex[image_hash[i] >> 4];
+        hash_print[i * 2 + 1] = hex[image_hash[i] & 0xf];
     }
+    hash_print[HASH_LEN * 2] = '\0';
     ESP_LOGI(TAG, "%s: %s", label, hash_print);
 }
 
@@ -110,12 +131,12 @@ static void ota_exit_no_update(esp_http_client_handle_t client, esp_ota_handle_t
     ESP_LOGI(TAG, "Для загрузки новой прошивки разместите актуальный файл на сервере");
 
     // Сбрасываем флаг активной OTA, чтобы задача прогресса корректно завершилась
-    s_ota_active = false;
-    s_ota_downloaded_bytes = 0;
-    s_ota_total_bytes = 0;
+    atomic_store(&s_ota_active, false);
+    atomic_store(&s_ota_downloaded_bytes, 0);
+    atomic_store(&s_ota_total_bytes, 0);
 
     // Очищаем ресурсы
-    if (update_handle > 0) {
+    if (update_handle != 0) {
         esp_ota_abort(update_handle);
     }
     http_cleanup(client);
@@ -136,6 +157,7 @@ static void ota_task(void *pvParameter)
     esp_err_t err;
     esp_ota_handle_t update_handle = 0;
     const esp_partition_t *update_partition = NULL;
+    char ota_write_data[BUFFSIZE + 1];  ///< Буфер загрузки (на стеке — экономит .bss)
 
     ESP_LOGI(TAG, "Запуск задачи OTA-обновления");
 
@@ -150,9 +172,9 @@ static void ota_task(void *pvParameter)
     }
     
     // Инициализируем переменные прогресса
-    s_ota_downloaded_bytes = 0;
-    s_ota_total_bytes = 0;
-    s_ota_active = true;
+    atomic_store(&s_ota_downloaded_bytes, 0);
+    atomic_store(&s_ota_total_bytes, 0);
+    // s_ota_active уже установлен в ota_start_task()
 
     const esp_partition_t *configured = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -184,22 +206,27 @@ static void ota_task(void *pvParameter)
     err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Не удалось открыть HTTP соединение: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
+        http_cleanup(client);
         task_fatal_error();
     }
     
     // Получаем длину файла из HTTP заголовков
-    s_ota_total_bytes = esp_http_client_fetch_headers(client);
-    if (s_ota_total_bytes > 0) {
-        ESP_LOGI(TAG, "Размер прошивки: %d байт (%.2f KB)", s_ota_total_bytes, s_ota_total_bytes / 1024.0);
+    int total = esp_http_client_fetch_headers(client);
+    atomic_store(&s_ota_total_bytes, total);
+    if (total > 0) {
+        ESP_LOGI(TAG, "Размер прошивки: %d байт (%.2f KB)", total, total / 1024.0);
     }
 
     update_partition = esp_ota_get_next_update_partition(NULL);
-    assert(update_partition != NULL);
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "Не найден OTA раздел для обновления");
+        http_cleanup(client);
+        task_fatal_error();
+    }
     ESP_LOGI(TAG, "Запись в раздел подтипа %d по смещению 0x%" PRIx32,
              update_partition->subtype, update_partition->address);
 
-    int binary_file_length = 0;
+    size_t binary_file_length = 0;
     bool image_header_was_checked = false;
     int last_progress = 0;
 
@@ -212,7 +239,7 @@ static void ota_task(void *pvParameter)
         if (data_read < 0) {
             ESP_LOGE(TAG, "Ошибка: ошибка чтения SSL данных");
             http_cleanup(client);
-            if (update_handle > 0) {
+            if (update_handle != 0) {
                 esp_ota_abort(update_handle);
             }
             task_fatal_error();
@@ -279,7 +306,7 @@ static void ota_task(void *pvParameter)
                     if (err != ESP_OK) {
                         ESP_LOGE(TAG, "Ошибка начала OTA (%s)", esp_err_to_name(err));
                         http_cleanup(client);
-                        esp_ota_abort(update_handle);
+                        // esp_ota_abort(update_handle) - не вызываем, хендл ещё не создан
                         task_fatal_error();
                     }
                     ESP_LOGI(TAG, "Начало OTA-обновления прошло успешно");
@@ -287,7 +314,7 @@ static void ota_task(void *pvParameter)
                 else {
                     ESP_LOGE(TAG, "Полученный пакет не соответствует ожидаемому размеру");
                     http_cleanup(client);
-                    esp_ota_abort(update_handle);
+                    // esp_ota_abort не вызываем — update_handle == 0 (UB)
                     task_fatal_error();
                 }
             }
@@ -299,18 +326,19 @@ static void ota_task(void *pvParameter)
                 task_fatal_error();
             }
             binary_file_length += data_read;
-            s_ota_downloaded_bytes = binary_file_length;
+            atomic_store(&s_ota_downloaded_bytes, (int)binary_file_length);
 
             // Выводим прогресс каждые 10%
-            if (s_ota_total_bytes > 0) {
-                int progress = (binary_file_length * 100) / s_ota_total_bytes;
+            int current_total = atomic_load(&s_ota_total_bytes);
+            if (current_total > 0) {
+                int progress = (int)((binary_file_length * 100) / (size_t)current_total);
                 if (progress != last_progress) {
-                    ESP_LOGI(TAG, "Прогресс загрузки: %d%% (%d/%d байт)",
-                            progress, binary_file_length, s_ota_total_bytes);
+                    ESP_LOGI(TAG, "Прогресс загрузки: %d%% (%zu/%d байт)",
+                            progress, binary_file_length, current_total);
                     last_progress = progress;
                 }
             }
-            ESP_LOGD(TAG, "Длина записанного образа %d", binary_file_length);
+            ESP_LOGD(TAG, "Длина записанного образа %zu", binary_file_length);
         }
         else {
             if (errno == ECONNRESET || errno == ENOTCONN) {
@@ -321,25 +349,24 @@ static void ota_task(void *pvParameter)
                 ESP_LOGI(TAG, "Соединение закрыто");
                 break;
             }
+            // Уступаем CPU если данных нет — предотвращаем busy-wait
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 
-    ESP_LOGI(TAG, "Общая длина записанных бинарных данных: %d", binary_file_length);
+    ESP_LOGI(TAG, "Общая длина записанных бинарных данных: %zu", binary_file_length);
 
     if (esp_http_client_is_complete_data_received(client) != true) {
         ESP_LOGE(TAG, "Ошибка при получении полного файла");
-        ESP_LOGE(TAG, "Загружено: %d байт из %d", binary_file_length, s_ota_total_bytes);
+        ESP_LOGE(TAG, "Загружено: %zu байт из %d", binary_file_length, atomic_load(&s_ota_total_bytes));
         
         // Публикуем ошибку
         mqtt_client_publish_ota_status("error_incomplete");
         
         http_cleanup(client);
         esp_ota_abort(update_handle);
-        
-        // Перезагружаем устройство через 5 секунд
-        ESP_LOGW(TAG, "Перезагрузка через 5 секунд...");
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
-        esp_restart();
+
+        ota_restart_with_delay();
     }
 
     err = esp_ota_end(update_handle);
@@ -354,11 +381,8 @@ static void ota_task(void *pvParameter)
         }
         
         http_cleanup(client);
-        
-        // Перезагружаем устройство через 5 секунд
-        ESP_LOGW(TAG, "Перезагрузка через 5 секунд...");
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
-        esp_restart();
+
+        ota_restart_with_delay();
     }
 
     err = esp_ota_set_boot_partition(update_partition);
@@ -370,9 +394,9 @@ static void ota_task(void *pvParameter)
     ESP_LOGI(TAG, "Подготовка к перезагрузке системы!");
     
     // Сбрасываем флаг активной OTA
-    s_ota_active = false;
-    s_ota_downloaded_bytes = 0;
-    s_ota_total_bytes = 0;
+    atomic_store(&s_ota_active, false);
+    atomic_store(&s_ota_downloaded_bytes, 0);
+    atomic_store(&s_ota_total_bytes, 0);
     
     esp_restart();
 }
@@ -387,39 +411,45 @@ static void ota_task(void *pvParameter)
  */
 int ota_get_progress_percent(void)
 {
-    if (!s_ota_active || s_ota_total_bytes <= 0) {
+    if (!atomic_load(&s_ota_active) || atomic_load(&s_ota_total_bytes) <= 0) {
         return -1;  // OTA не активна
     }
-    return (s_ota_downloaded_bytes * 100) / s_ota_total_bytes;
+    return (atomic_load(&s_ota_downloaded_bytes) * 100) / atomic_load(&s_ota_total_bytes);
 }
 
-/**
- * @brief Получить общий размер загружаемого файла в байтах
- * @return Размер файла в байтах, или 0 если неизвестно
- */
 int ota_get_total_size(void)
 {
-    return s_ota_total_bytes;
+    return atomic_load(&s_ota_total_bytes);
 }
 
-/**
- * @brief Получить количество загруженных байт
- * @return Количество загруженных байт
- */
 int ota_get_downloaded_bytes(void)
 {
-    return s_ota_downloaded_bytes;
+    return atomic_load(&s_ota_downloaded_bytes);
+}
+
+bool ota_is_active(void)
+{
+    return atomic_load(&s_ota_active);
 }
 
 bool ota_diagnostic(void)
 {
+    // ПРИМЕЧАНИЕ: GPIO 34-39 на ESP32 — input-only и не имеют внутренних подтяжек.
+    // Установлено GPIO_PULLUP_DISABLE — требуется внешний подтягивающий резистор (10kΩ к VCC).
     gpio_config_t io_conf;
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    gpio_config(&io_conf);
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+
+    // Проверяем результат gpio_config — ошибка означает что диагностику доверять нельзя
+    esp_err_t gpio_err = gpio_config(&io_conf);
+    if (gpio_err != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка конфигурации GPIO диагностики (%d): %s — диагностика провалена",
+                 CONFIG_EXAMPLE_GPIO_DIAGNOSTIC, esp_err_to_name(gpio_err));
+        return false;  // Безопасный fallback — откат прошивки
+    }
 
     ESP_LOGI(TAG, "Диагностика (5 сек)...");
     vTaskDelay(5000 / portTICK_PERIOD_MS);
@@ -434,7 +464,9 @@ void ota_check_and_diagnose(void)
     ESP_LOGI(TAG, "Проверка состояния прошивки");
 
     uint8_t sha_256[HASH_LEN] = {0};
+    // memset гарантирует что поля flash_chip, label, encrypted не содержат мусор
     esp_partition_t partition;
+    memset(&partition, 0, sizeof(partition));
 
     partition.address = ESP_PARTITION_TABLE_OFFSET;
     partition.size = ESP_PARTITION_TABLE_MAX_LEN;
@@ -499,10 +531,22 @@ void ota_init(void)
 void ota_start_task(void)
 {
     // Защита от повторного запуска OTA
-    if (s_ota_active) {
-        ESP_LOGW(TAG, "OTA уже выполняется, игнорируем команду");
+    if (atomic_load(&s_ota_active)) {
+        ESP_LOGW(TAG, "OTA уже выполняется, игнорирую команду");
         return;
     }
     
-    xTaskCreatePinnedToCore(&ota_task, "ota_task", 8192, NULL, 5, NULL, PRO_CPU_NUM);
+    // Устанавливаем флаг ДО создания задачи — закрываем race condition
+    // между проверкой в ota_start_task() и установкой внутри ota_task()
+    atomic_store(&s_ota_active, true);
+    
+    BaseType_t res = xTaskCreatePinnedToCore(&ota_task, "ota_task", 8192, NULL, 5, NULL, PRO_CPU_NUM);
+    if (res != pdPASS) {
+        ESP_LOGE(TAG, "Не удалось создать задачу OTA: %d", res);
+        atomic_store(&s_ota_active, false);
+        mqtt_client_publish_ota_status("failed");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Задача OTA создана успешно");
 }

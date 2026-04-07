@@ -28,14 +28,13 @@
  * @endcode
  * 
  * @author HydroNFT Team
- * @version 1.0
- * @date 2024
+ * @version 2.0
+ * @date 2026
  */
 
-#ifndef HYDRO_MQTT_CLIENT_H
-#define HYDRO_MQTT_CLIENT_H
+#pragma once
 
-#include <stdbool.h>  // Для типа bool
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,47 +85,21 @@ void mqtt_client_init(void);
 bool mqtt_client_is_connected(void);
 
 /**
- * @brief Проверка флага запроса OTA обновления
- * 
- * Возвращает состояние флага, который устанавливается при получении
- * MQTT команды из топика hydro/ota/update со значением "START".
- * 
- * @return true если получена команда на OTA обновление через MQTT
- * @return false если команда не получена
- * 
- * @note Флаг устанавливается в обработчике MQTT событий
- * @note После получения флага необходимо вызвать mqtt_client_reset_ota_flag()
- * 
- * Пример использования в main.c:
- * @code
- * void mqtt_ota_check_task(void *pvParameters) {
- *     while (1) {
- *         if (mqtt_client_is_connected() && mqtt_client_get_ota_flag()) {
- *             mqtt_client_reset_ota_flag();
- *             ota_start_task();  // Запуск OTA обновления
- *         }
- *         vTaskDelay(pdMS_TO_TICKS(1000));
- *     }
- * }
- * @endcode
- * 
- * @see mqtt_client_reset_ota_flag()
- * @see ota_start_task()
- */
-bool mqtt_client_get_ota_flag(void);
-
-/**
  * @brief Сброс флага OTA обновления
- * 
+ *
  * Сбрасывает флаг ota_update_requested в false.
  * Вызывается после обработки флага для предотвращения
  * повторного запуска OTA обновления.
- * 
+ *
  * @note Вызывается в mqtt_ota_check_task() после получения флага
- * 
- * @see mqtt_client_get_ota_flag()
  */
 void mqtt_client_reset_ota_flag(void);
+
+/**
+ * @brief Проверка, была ли уже запрошена OTA
+ * @return true если OTA уже запрошена (даже если ещё не запущена задача)
+ */
+bool mqtt_client_is_ota_requested(void);
 
 /**
  * @brief Публикация статуса OTA обновления
@@ -165,8 +138,7 @@ void mqtt_client_publish_ota_status(const char *status);
  * 
  * @note Функция проверяет подключение перед публикацией
  * @note Рекомендуется вызывать каждые 5-10 секунд
- * @note В текущей версии используются заглушки read_*()
- * @note ЗАМЕНИТЕ на реальные функции чтения с ADC/ADS1115
+ * @note Данные читаются из ADS1115 (каналы 0-3) и DHT датчика
  * 
  * Пример использования в задаче FreeRTOS:
  * @code
@@ -181,14 +153,6 @@ void mqtt_client_publish_ota_status(const char *status);
  * @endcode
  */
 void mqtt_client_publish_sensor_data(void);
-
-// Функция mqtt_client_publish_time() отключена - время не публикуется в MQTT
-
-// ============================================================================
-// ФУНКЦИИ УПРАВЛЕНИЯ КЛАПАНОМ (объявления в main.h)
-// ============================================================================
-
-// set_valve_state() и get_valve_state() объявлены в main.h
 
 /**
  * @brief Публикация прогресса OTA обновления в MQTT
@@ -251,5 +215,3 @@ void mqtt_client_publish_touch_state(bool state);
 #ifdef __cplusplus
 }
 #endif
-
-#endif // HYDRO_MQTT_CLIENT_H

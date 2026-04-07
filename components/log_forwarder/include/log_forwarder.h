@@ -47,6 +47,14 @@ void log_forwarder_enable(bool enable);
  */
 bool log_forwarder_is_enabled(void);
 
+/**
+ * @brief Отправка MQTT Discovery конфигурации для сенсора логов
+ *
+ * Вызывается из mqtt_client при первом подключении к брокеру.
+ * Регистрирует сенсор логов в Home Assistant.
+ */
+void log_forwarder_send_discovery(void);
+
 #ifdef __cplusplus
 }
 #endif

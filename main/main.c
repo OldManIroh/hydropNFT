@@ -10,11 +10,12 @@
  */
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
 #include "esp_log.h"
-#include "driver/gpio.h"
+#include "esp_timer.h"
 #include "dht.h"
 #include "ads1115.h"
 #include "device_control.h"
@@ -27,6 +28,10 @@
 
 #ifndef APP_CPU_NUM
 #define APP_CPU_NUM 1  ///< Ядро 1 (APP_CPU) для задач
+#endif
+
+#ifndef PRO_CPU_NUM
+#define PRO_CPU_NUM 0  ///< Ядро 0 (PRO_CPU) для задач
 #endif
 
 /// Тег для системы логирования ESP-IDF
@@ -46,14 +51,11 @@ static const char *TAG = "main";
 #define DHT_TYPE DHT_TYPE_DHT11
 #endif
 
-/// Час включения света по расписанию
-#define LIGHT_ON_HOUR 8
+/// Час включения света по расписанию (настраивается через menuconfig)
+#define LIGHT_ON_HOUR CONFIG_LIGHT_ON_HOUR
 
-/// Смещение часового пояса (UTC+5)
-#define TIMEZONE_OFFSET_SECONDS (5 * 3600)
-
-/// Время слива воды через клапан (5 минут)
-#define VALVE_DRAIN_DURATION_SECONDS (5 * 60)
+/// Время слива воды через клапан (5 минут) — используется esp_timer для монотонности
+#define VALVE_DRAIN_DURATION_US (5LL * 60 * 1000000)  // 5 мин в микросекундах
 
 // ============================================================================
 // EVENT GROUP для мгновенной реакции задач на изменения режимов
@@ -62,11 +64,7 @@ static const char *TAG = "main";
 /// EventGroup для синхронизации задач расписания
 static EventGroupHandle_t s_schedule_event = NULL;
 
-/// Бит: режим устройства изменён (свет/насос/клапан)
-#define MODE_CHANGED_BIT    BIT0
-
-/// Бит: получен флаг OTA обновления
-#define OTA_FLAG_BIT        BIT1
+// Биты EventGroup определены в device_control.h — используются напрямую
 
 // ============================================================================
 // ЗАДАЧА ЧТЕНИЯ DHT ДАТЧИКА
@@ -87,9 +85,10 @@ void dht_task(void *pvParameters)
     float temperature, humidity;
 
 #ifdef CONFIG_EXAMPLE_INTERNAL_PULLUP
-    gpio_set_pull_mode(DHT_PIN, GPIO_PULLUP_ONLY);
+    device_control_set_dht_pullup(true);
     ESP_LOGI(TAG, "DHT: Внутренний pull-up резистор включён");
 #else
+    device_control_set_dht_pullup(false);
     ESP_LOGI(TAG, "DHT: Внутренний pull-up резистор выключен (требуется внешний 10kΩ)");
 #endif
 
@@ -105,6 +104,8 @@ void dht_task(void *pvParameters)
             device_control_set_dht_data(temperature, humidity, true);
             ESP_LOGI(TAG, "DHT: Влажность=%.1f%% Температура=%.1f°C", humidity, temperature);
         } else {
+            // Сбрасываем valid чтобы не публиковать устаревшие данные
+            device_control_set_dht_data(0.0f, 0.0f, false);
             ESP_LOGD(TAG, "Ошибка чтения DHT датчика: %d", res);
         }
 
@@ -209,15 +210,16 @@ void mqtt_ota_check_task(void *pvParameters)
     EventGroupHandle_t event = (EventGroupHandle_t)pvParameters;
 
     while (1) {
-        if (mqtt_client_is_connected() && mqtt_client_get_ota_flag()) {
+        if (mqtt_client_is_connected() && mqtt_client_is_ota_requested()) {
             ESP_LOGI(TAG, "Получена команда OTA обновления из MQTT...");
 
+            // Сначала сбрасываем флаг, затем запускаем OTA
             mqtt_client_reset_ota_flag();
             start_ota_progress_task();
             ota_start_task();
         }
 
-        xEventGroupWaitBits(event, OTA_FLAG_BIT,
+        xEventGroupWaitBits(event, DEVICE_CTRL_OTA_FLAG_BIT,
                            pdTRUE, pdFALSE,
                            pdMS_TO_TICKS(1000));
     }
@@ -251,9 +253,8 @@ void light_schedule_task(void *pvParameters)
 
         time_t now;
         time(&now);
-        now += TIMEZONE_OFFSET_SECONDS;
         struct tm timeinfo;
-        gmtime_r(&now, &timeinfo);
+        localtime_r(&now, &timeinfo);
 
         int current_hour = timeinfo.tm_hour;
 
@@ -270,7 +271,7 @@ void light_schedule_task(void *pvParameters)
         prev_mode = current_mode;
 
         if (current_mode == DEVICE_MODE_MANUAL) {
-            xEventGroupWaitBits(event, MODE_CHANGED_BIT,
+            xEventGroupWaitBits(event, DEVICE_CTRL_LIGHT_MODE_BIT,
                                pdTRUE, pdFALSE,
                                pdMS_TO_TICKS(60000));
             continue;
@@ -287,7 +288,7 @@ void light_schedule_task(void *pvParameters)
             device_control_set_light_state(false);
         }
 
-        xEventGroupWaitBits(event, MODE_CHANGED_BIT,
+        xEventGroupWaitBits(event, DEVICE_CTRL_LIGHT_MODE_BIT,
                            pdTRUE, pdFALSE,
                            pdMS_TO_TICKS(60000));
     }
@@ -325,13 +326,13 @@ void pump_valve_schedule_task(void *pvParameters)
 
     typedef enum {
         STATE_CIRCULATING,   ///< День: насос ВКЛ, клапан ЗАКРЫТ, ждём ESP-NOW true
-        STATE_DRAINING,      ///< День: насос ВЫКЛ, клапан ОТКРЫТ, таймер 20 мин
+        STATE_DRAINING,      ///< День: насос ВЫКЛ, клапан ОТКРЫТ, таймер 5 мин
         STATE_NIGHT_STOP,    ///< Ночь: насос работал при закате, ждём ESP-NOW true
         STATE_NIGHT_IDLE,    ///< Ночь: насос ВЫКЛ, клапан ЗАКРЫТ, ждём рассвет
     } pump_valve_state_t;
 
     pump_valve_state_t state = STATE_CIRCULATING;
-    time_t drain_start_time = 0;
+    int64_t drain_start_us = 0;   // Монотонное время (esp_timer)
     bool last_espnow_state = false;
     bool prev_daytime = false;  ///< Будет инициализировано при первом цикле
 
@@ -345,9 +346,8 @@ void pump_valve_schedule_task(void *pvParameters)
 
         time_t now;
         time(&now);
-        now += TIMEZONE_OFFSET_SECONDS;
         struct tm timeinfo;
-        gmtime_r(&now, &timeinfo);
+        localtime_r(&now, &timeinfo);
         int current_hour = timeinfo.tm_hour;
         bool is_daytime = (current_hour >= LIGHT_ON_HOUR);
 
@@ -357,6 +357,7 @@ void pump_valve_schedule_task(void *pvParameters)
         static bool first_run = true;
         if (first_run) {
             prev_daytime = is_daytime;
+            last_espnow_state = espnow_high;  // Инициализируем состояние ESP-NOW
             first_run = false;
             ESP_LOGI(TAG, "Начальное состояние: %s, state=%s",
                      is_daytime ? "ДЕНЬ" : "НОЧЬ",
@@ -371,24 +372,25 @@ void pump_valve_schedule_task(void *pvParameters)
 
         if (prev_mode == DEVICE_MODE_MANUAL && current_mode == DEVICE_MODE_AUTO) {
             // Переход в AUTO — проверяем реальный уровень воды
-            device_control_set_valve_state(false);
             if (is_daytime) {
                 if (espnow_high) {
                     // Верхний уровень достигнут — слив
                     ESP_LOGI(TAG, "Переход в AUTO: верхний уровень, начинаю слив");
                     device_control_set_pump_state(false);
                     device_control_set_valve_state(true);
-                    drain_start_time = now;
+                    drain_start_us = esp_timer_get_time();
                     state = STATE_DRAINING;
                 } else {
                     // Нижний уровень — циркуляция
                     ESP_LOGI(TAG, "Переход в AUTO: нижний уровень, насос ВКЛ");
                     device_control_set_pump_state(true);
+                    device_control_set_valve_state(false);
                     state = STATE_CIRCULATING;
                 }
             } else {
                 // Ночь — всё ВЫКЛ
                 device_control_set_pump_state(false);
+                device_control_set_valve_state(false);
                 state = STATE_NIGHT_IDLE;
                 ESP_LOGI(TAG, "Переход в AUTO: ночь, всё ВЫКЛ");
             }
@@ -400,7 +402,7 @@ void pump_valve_schedule_task(void *pvParameters)
         if (current_mode == DEVICE_MODE_MANUAL) {
             last_espnow_state = espnow_high;
             prev_daytime = is_daytime;
-            xEventGroupWaitBits(event, MODE_CHANGED_BIT,
+            xEventGroupWaitBits(event, DEVICE_CTRL_PUMP_MODE_BIT,
                                pdTRUE, pdFALSE,
                                pdMS_TO_TICKS(10000));
             continue;
@@ -430,16 +432,20 @@ void pump_valve_schedule_task(void *pvParameters)
                     } else {
                         state = STATE_NIGHT_IDLE;
                         ESP_LOGI(TAG, "Ночь: насос уже выключен, переходим в ожидание");
+                        device_control_set_pump_state(false);
+                        device_control_set_valve_state(false);
                     }
                 } else if (state == STATE_DRAINING) {
-                    // Слив во время заката — закрываем клапан
-                    ESP_LOGI(TAG, "Ночь во время слива — клапан ЗАКРЫТ");
+                    // Слив во время заката — закрываем клапан, насос ВЫКЛ
+                    ESP_LOGI(TAG, "Ночь во время слива — клапан ЗАКРЫТ, насос ВЫКЛ");
                     device_control_set_valve_state(false);
+                    device_control_set_pump_state(false);
                     state = STATE_NIGHT_IDLE;
+                } else if (state == STATE_NIGHT_STOP || state == STATE_NIGHT_IDLE) {
+                    // Уже в ночном состоянии — гарантируем ВЫКЛ
+                    device_control_set_pump_state(false);
+                    device_control_set_valve_state(false);
                 }
-                // Гарантированно выключаем насос и клапан на ночь
-                device_control_set_pump_state(false);
-                device_control_set_valve_state(false);
             }
             prev_daytime = is_daytime;
         }
@@ -451,17 +457,17 @@ void pump_valve_schedule_task(void *pvParameters)
         case STATE_CIRCULATING:
             // День: насос работает, ждём ESP-NOW false→true (фронт)
             if (espnow_high && !last_espnow_state) {
-                ESP_LOGI(TAG, "День: верхний уровень — насос ВЫКЛ, клапан ОТКРЫТ на 20 мин");
+                ESP_LOGI(TAG, "День: верхний уровень — насос ВЫКЛ, клапан ОТКРЫТ на 5 мин");
                 device_control_set_pump_state(false);
                 device_control_set_valve_state(true);
-                drain_start_time = now;
+                drain_start_us = esp_timer_get_time();
                 state = STATE_DRAINING;
             }
             break;
 
         case STATE_DRAINING:
-            // День: ждём истечения 20 минут
-            if ((now - drain_start_time) >= VALVE_DRAIN_DURATION_SECONDS) {
+            // День: ждём истечения 5 минут (монотонный таймер)
+            if ((esp_timer_get_time() - drain_start_us) >= VALVE_DRAIN_DURATION_US) {
                 ESP_LOGI(TAG, "Слив завершён (5 мин) — клапан ЗАКРЫТ, насос ВКЛ");
                 device_control_set_valve_state(false);
                 device_control_set_pump_state(true);
@@ -489,7 +495,7 @@ void pump_valve_schedule_task(void *pvParameters)
         }
 
         last_espnow_state = espnow_high;
-        xEventGroupWaitBits(event, MODE_CHANGED_BIT,
+        xEventGroupWaitBits(event, DEVICE_CTRL_PUMP_MODE_BIT,
                            pdTRUE, pdFALSE,
                            pdMS_TO_TICKS(10000));
     }
@@ -500,6 +506,7 @@ void pump_valve_schedule_task(void *pvParameters)
 // ============================================================================
 
 static TaskHandle_t ota_progress_task_handle = NULL;
+static _Atomic bool s_ota_progress_task_active = false;
 
 /**
  * @brief Задача для публикации прогресса OTA обновления в MQTT
@@ -531,56 +538,66 @@ void mqtt_ota_progress_task(void *pvParameters)
             ESP_LOGI(TAG, "OTA прогресс: %d%% (%d/%d)", progress, downloaded, total);
             last_progress = progress;
             no_change_count = 0;
+        } else if (ota_is_active()) {
+            // OTA активна, но загрузка ещё не началась (HTTP подключение)
+            // Не считаем это как "без изменений" — ждём реального прогресса
+            no_change_count = 0;
         } else {
             no_change_count++;
-            
+
             if (no_change_count >= 3) {
                 ESP_LOGI(TAG, "OTA сессия завершена (прогресс: %d%%)", last_progress);
-                
+
                 if (last_progress == 100) {
                     mqtt_client_publish_ota_status("completed");
                 }
-                
+
                 ESP_LOGI(TAG, "Задача публикации прогресса OTA завершается");
-                
+
+                // Сбрасываем флаг и обнуляем handle перед удалением задачи
+                atomic_store(&s_ota_progress_task_active, false);
                 ota_progress_task_handle = NULL;
                 vTaskDelete(NULL);
             }
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 /**
  * @brief Запуск задачи публикации прогресса OTA
+ *
+ * @note Использует атомарный флаг для отслеживания состояния задачи вместо eTaskGetState()
  */
 void start_ota_progress_task(void)
 {
-    if (ota_progress_task_handle == NULL) {
-        xTaskCreatePinnedToCore(
-            mqtt_ota_progress_task,
-            "mqtt_ota_progress_task",
-            4096,
-            NULL,
-            4,
-            &ota_progress_task_handle,
-            PRO_CPU_NUM
-        );
-        ESP_LOGI(TAG, "Задача публикации прогресса OTA создана");
-    }
-}
-
-/**
- * @brief Остановка задачи публикации прогресса OTA
- */
-void stop_ota_progress_task(void)
-{
     if (ota_progress_task_handle != NULL) {
-        vTaskDelete(ota_progress_task_handle);
-        ota_progress_task_handle = NULL;
-        ESP_LOGI(TAG, "Задача публикации прогресса OTA остановлена");
+        // Проверяем атомарный флаг вместо eTaskGetState()
+        if (!atomic_load(&s_ota_progress_task_active)) {
+            ESP_LOGI(TAG, "Задача прогресса OTA завершена, обнуляю handle");
+            ota_progress_task_handle = NULL;
+        } else {
+            ESP_LOGW(TAG, "Задача прогресса OTA ещё активна");
+            return;
+        }
     }
+    TaskHandle_t tmp = NULL;
+    if (xTaskCreatePinnedToCore(
+        mqtt_ota_progress_task,
+        "mqtt_ota_progress_task",
+        3076,
+        NULL,
+        4,
+        &tmp,
+        PRO_CPU_NUM
+    ) != pdPASS) {
+        ESP_LOGE(TAG, "КРИТИЧЕСКАЯ ОШИБКА: не удалось создать задачу 'mqtt_ota_progress_task'");
+        return;
+    }
+    ota_progress_task_handle = tmp;
+    atomic_store(&s_ota_progress_task_active, true);
+    ESP_LOGI(TAG, "Задача публикации прогресса OTA создана");
 }
 
 // ============================================================================
@@ -589,7 +606,7 @@ void stop_ota_progress_task(void)
 
 /**
  * @brief Главная функция приложения - точка входа
- * 
+ *
  * @note После запуска задач управление передаётся планировщику FreeRTOS
  */
 void app_main(void)
@@ -661,7 +678,7 @@ void app_main(void)
     // 6. ЗАПУСК ЗАДАЧ FREERTOS
     // ==========================================================================
 
-    xTaskCreatePinnedToCore(
+    if (xTaskCreatePinnedToCore(
         dht_task,
         "dht_task",
         4096,
@@ -669,9 +686,11 @@ void app_main(void)
         3,
         NULL,
         APP_CPU_NUM
-    );
+    ) != pdPASS) {
+        ESP_LOGE(TAG, "КРИТИЧЕСКАЯ ОШИБКА: не удалось создать задачу 'dht_task'");
+    }
 
-    xTaskCreatePinnedToCore(
+    if (xTaskCreatePinnedToCore(
         ads1115_task,
         "ads1115_task",
         4096,
@@ -679,9 +698,11 @@ void app_main(void)
         4,
         NULL,
         APP_CPU_NUM
-    );
+    ) != pdPASS) {
+        ESP_LOGE(TAG, "КРИТИЧЕСКАЯ ОШИБКА: не удалось создать задачу 'ads1115_task'");
+    }
 
-    xTaskCreatePinnedToCore(
+    if (xTaskCreatePinnedToCore(
         mqtt_sensor_task,
         "mqtt_sensor_task",
         3072,
@@ -689,19 +710,23 @@ void app_main(void)
         4,
         NULL,
         PRO_CPU_NUM
-    );
+    ) != pdPASS) {
+        ESP_LOGE(TAG, "КРИТИЧЕСКАЯ ОШИБКА: не удалось создать задачу 'mqtt_sensor_task'");
+    }
 
-    xTaskCreatePinnedToCore(
+    if (xTaskCreatePinnedToCore(
         mqtt_ota_check_task,
         "mqtt_ota_check_task",
-        4096,
+        2048,
         (void *)s_schedule_event,
         4,
         NULL,
         PRO_CPU_NUM
-    );
+    ) != pdPASS) {
+        ESP_LOGE(TAG, "КРИТИЧЕСКАЯ ОШИБКА: не удалось создать задачу 'mqtt_ota_check_task'");
+    }
 
-    xTaskCreatePinnedToCore(
+    if (xTaskCreatePinnedToCore(
         light_schedule_task,
         "light_schedule_task",
         3072,
@@ -709,9 +734,11 @@ void app_main(void)
         3,
         NULL,
         PRO_CPU_NUM
-    );
+    ) != pdPASS) {
+        ESP_LOGE(TAG, "КРИТИЧЕСКАЯ ОШИБКА: не удалось создать задачу 'light_schedule_task'");
+    }
 
-    xTaskCreatePinnedToCore(
+    if (xTaskCreatePinnedToCore(
         pump_valve_schedule_task,
         "pump_valve_schedule",
         3072,
@@ -719,9 +746,11 @@ void app_main(void)
         3,
         NULL,
         PRO_CPU_NUM
-    );
+    ) != pdPASS) {
+        ESP_LOGE(TAG, "КРИТИЧЕСКАЯ ОШИБКА: не удалось создать задачу 'pump_valve_schedule_task'");
+    }
 
-    xTaskCreatePinnedToCore(
+    if (xTaskCreatePinnedToCore(
         espnow_receiver_task,
         "espnow_receiver_task",
         4096,
@@ -729,9 +758,14 @@ void app_main(void)
         4,
         NULL,
         PRO_CPU_NUM
-    );
+    ) != pdPASS) {
+        ESP_LOGE(TAG, "КРИТИЧЕСКАЯ ОШИБКА: не удалось создать задачу 'espnow_receiver_task'");
+    }
 
     ESP_LOGI(TAG, "Приложение запущено. Ожидание команд MQTT...");
     ESP_LOGI(TAG, "SNTP инициализирован. Время синхронизируется");
     ESP_LOGI(TAG, "Задачи распределены: ADS1115/DHT - ядро 1, MQTT/OTA/SNTP - ядро 0");
+
+    // Удаляем задачу main — она больше не нужна, экономим ~3KB RAM
+    vTaskDelete(NULL);
 }

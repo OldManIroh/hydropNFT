@@ -1,33 +1,52 @@
-menu "SNTP Client Configuration"
+menu "Настройки SNTP (времени)"
+
+    choice SNTP_SERVER_COUNT
+        prompt "Количество NTP серверов"
+        default SNTP_SERVER_COUNT_4
+        help
+            Число NTP серверов для отказоустойчивости.
+
+            Примечание: также увеличьте CONFIG_LWIP_SNTP_MAX_SERVERS (по умолч.: 1):
+            menuconfig → Component config → LWIP → SNTP → Max SNTP servers
+
+        config SNTP_SERVER_COUNT_1
+            bool "1 сервер"
+        config SNTP_SERVER_COUNT_2
+            bool "2 сервера"
+        config SNTP_SERVER_COUNT_3
+            bool "3 сервера"
+        config SNTP_SERVER_COUNT_4
+            bool "4 сервера"
+    endchoice
 
     config SNTP_SERVER_1
-        string "Primary NTP Server"
+        string "Основной NTP сервер"
         default "ntp.msk-ix.ru"
         help
-            Primary NTP server for time synchronization.
+            Основной сервер для синхронизации времени.
 
     config SNTP_SERVER_2
-        string "Secondary NTP Server"
+        string "Резервный NTP сервер"
         default "ru.pool.ntp.org"
         help
-            Secondary NTP server for time synchronization.
+            Первый резервный сервер.
 
     config SNTP_SERVER_3
-        string "Tertiary NTP Server"
+        string "Второй резервный NTP сервер"
         default "pool.ntp.org"
         help
-            Tertiary NTP server for time synchronization.
+            Второй резервный сервер.
 
     config SNTP_SERVER_4
-        string "Quaternary NTP Server"
+        string "Третий резервный NTP сервер"
         default "time.google.com"
         help
-            Quaternary NTP server for time synchronization.
+            Третий резервный сервер.
 
     config SNTP_SYNC_RETRY_COUNT
-        int "SNTP Sync Retry Count"
+        int "Количество попыток синхронизации"
         default 30
         help
-            Number of retries for SNTP synchronization before giving up.
+            Число попыток синхронизации SNTP перед отказом.
 
 endmenu

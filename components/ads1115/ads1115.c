@@ -16,19 +16,19 @@
  *
  * @author HydroNFT Team
  * @version 2.0
- * @date 2024
+ * @date 2026
  */
 
 #include <stdio.h>
+#include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
-#include <ads111x.h>
-#include <string.h>
-#include <i2cdev.h>
-#include "ads1115.h"
 #include "esp_log.h"
 #include "driver/i2c.h"
+#include <ads111x.h>
+#include <i2cdev.h>
+#include "ads1115.h"
 
 #define I2C_PORT 0
 #define GAIN ADS111X_GAIN_4V096  ///< Коэффициент усиления: ±4.096В
@@ -46,6 +46,9 @@ static float gain_val;
 
 /// Флаг инициализации (защита от повторной инициализации)
 static bool ads1115_initialized = false;
+
+/// Флаг: этот компонент вызывал i2cdev_init() — для корректной деинициализации
+static bool s_i2cdev_owned = false;
 
 /// Мьютекс для защиты доступа к I2C шине
 static SemaphoreHandle_t ads1115_mutex = NULL;
@@ -156,12 +159,13 @@ esp_err_t ads1115_init(void)
         ESP_LOGI(TAG, "Мьютекс данных ADS1115 создан");
     }
 
-    // Инициализация библиотеки I2C
+    // Инициализация библиотеки I2C (только если ещё не инициализирована другим компонентом)
     esp_err_t res = i2cdev_init();
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Ошибка инициализации I2C библиотеки: %d", res);
         return res;
     }
+    s_i2cdev_owned = true;
 
     // Очистка дескрипторов устройства
     memset(&device, 0, sizeof(device));
@@ -200,6 +204,70 @@ esp_err_t ads1115_init(void)
 }
 
 /**
+ * @brief Внутреннее чтение напряжения без mutex (для batch-измерений)
+ * @param channel Номер канала (0-3)
+ * @param voltage Указатель для хранения значения напряжения
+ * @return ESP_OK при успехе, код ошибки в противном случае
+ *
+ * @warning Вызывающий обязан сам захватить mutex перед вызовом
+ */
+static esp_err_t ads1115_read_voltage_no_mutex(uint8_t channel, float *voltage)
+{
+    int16_t raw = 0;
+    esp_err_t res;
+
+    // Установка входного мультиплексора для канала
+    res = ads111x_set_input_mux(&device, mux_settings[channel]);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка установки мультиплексора канала %u: %s",
+                 channel, esp_err_to_name(res));
+        return res;
+    }
+
+    // Запуск преобразования
+    res = ads111x_start_conversion(&device);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка запуска конвертации канала %u: %s",
+                 channel, esp_err_to_name(res));
+        return res;
+    }
+
+    // Ожидание завершения преобразования с таймаутом
+    bool busy;
+    TickType_t start_tick = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(ADS1115_CONVERSION_TIMEOUT_MS);
+
+    do {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        res = ads111x_is_busy(&device, &busy);
+        if (res != ESP_OK) {
+            ESP_LOGE(TAG, "Ошибка проверки статуса канала %u: %s",
+                     channel, esp_err_to_name(res));
+            return res;
+        }
+
+        // Проверка таймаута
+        if (xTaskGetTickCount() - start_tick > timeout_ticks) {
+            ESP_LOGE(TAG, "Таймаут ожидания конвертации канала %u", channel);
+            return ESP_ERR_TIMEOUT;
+        }
+    } while (busy);
+
+    // Чтение результата
+    res = ads111x_get_value(&device, &raw);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка чтения значения канала %u: %s",
+                 channel, esp_err_to_name(res));
+        return res;
+    }
+
+    // Расчёт напряжения: V = (gain × raw) / MAX_VALUE
+    *voltage = (gain_val * (float)raw) / (float)ADS111X_MAX_VALUE;
+
+    return ESP_OK;
+}
+
+/**
  * @brief Чтение напряжения с определенного канала
  * @param channel Номер канала (0-3)
  * @param voltage Указатель для хранения значения напряжения
@@ -220,73 +288,24 @@ esp_err_t ads1115_read_voltage(uint8_t channel, float *voltage)
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Защита от вызова до инициализации — mutex может быть NULL
+    if (ads1115_mutex == NULL) {
+        ESP_LOGE(TAG, "ADS1115 не инициализирован (mutex NULL)");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // Захватываем мьютекс
     if (xSemaphoreTake(ads1115_mutex, pdMS_TO_TICKS(ADS1115_I2C_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "Не удалось захватить мьютекс ADS1115");
         return ESP_ERR_TIMEOUT;
     }
 
-    int16_t raw = 0;
-    esp_err_t res;
-
-    // Установка входного мультиплексора для канала
-    res = ads111x_set_input_mux(&device, mux_settings[channel]);
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка установки мультиплексора канала %u: %s",
-                 channel, esp_err_to_name(res));
-        xSemaphoreGive(ads1115_mutex);
-        return res;
-    }
-
-    // Запуск преобразования
-    res = ads111x_start_conversion(&device);
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка запуска конвертации канала %u: %s",
-                 channel, esp_err_to_name(res));
-        xSemaphoreGive(ads1115_mutex);
-        return res;
-    }
-
-    // Ожидание завершения преобразования с таймаутом
-    bool busy;
-    TickType_t start_tick = xTaskGetTickCount();
-    const TickType_t timeout_ticks = pdMS_TO_TICKS(ADS1115_CONVERSION_TIMEOUT_MS);
-
-    do {
-        vTaskDelay(pdMS_TO_TICKS(1));
-        res = ads111x_is_busy(&device, &busy);
-        if (res != ESP_OK) {
-            ESP_LOGE(TAG, "Ошибка проверки статуса канала %u: %s",
-                     channel, esp_err_to_name(res));
-            xSemaphoreGive(ads1115_mutex);
-            return res;
-        }
-
-        // Проверка таймаута
-        if (xTaskGetTickCount() - start_tick > timeout_ticks) {
-            ESP_LOGE(TAG, "Таймаут ожидания конвертации канала %u", channel);
-            xSemaphoreGive(ads1115_mutex);
-            return ESP_ERR_TIMEOUT;
-        }
-    } while (busy);
-
-    // Чтение результата
-    res = ads111x_get_value(&device, &raw);
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка чтения значения канала %u: %s",
-                 channel, esp_err_to_name(res));
-        xSemaphoreGive(ads1115_mutex);
-        return res;
-    }
+    esp_err_t res = ads1115_read_voltage_no_mutex(channel, voltage);
 
     // Освобождаем мьютекс
     xSemaphoreGive(ads1115_mutex);
 
-    // Расчёт напряжения: V = (gain × raw) / MAX_VALUE
-    // gain_val = 4.096В, ADS111X_MAX_VALUE = 32767 (2^15-1)
-    *voltage = (gain_val * (float)raw) / (float)ADS111X_MAX_VALUE;
-
-    return ESP_OK;
+    return res;
 }
 
 /**
@@ -308,17 +327,24 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Захватываем mutex ОДИН раз на все 4 канала — экономим 6 semaphore ops
+    if (ads1115_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(ads1115_mutex, pdMS_TO_TICKS(ADS1115_I2C_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE(TAG, "Не удалось захватить мьютекс ADS1115");
+        return ESP_ERR_TIMEOUT;
+    }
+
     esp_err_t overall_result = ESP_OK;
 
     for (size_t ch = 0; ch < 4; ch++) {
-        // Инициализация структуры измерения
         measurements[ch].channel = ch;
         measurements[ch].voltage = 0.0f;
         measurements[ch].error = ESP_OK;
 
-        // Читаем напряжение с канала
         float voltage = 0.0f;
-        esp_err_t res = ads1115_read_voltage(ch, &voltage);
+        esp_err_t res = ads1115_read_voltage_no_mutex(ch, &voltage);
 
         if (res != ESP_OK) {
             measurements[ch].error = res;
@@ -361,6 +387,9 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
         }
         xSemaphoreGive(s_data_mutex);
     }
+
+    // Освобождаем mutex (был захвачен один раз на все 4 канала)
+    xSemaphoreGive(ads1115_mutex);
 
     return overall_result;
 }
@@ -430,8 +459,11 @@ void ads1115_deinit(void)
     // Сбрасываем состояние фильтра
     memset(&filter_state, 0, sizeof(filter_state));
 
-    // Освобождаем ресурсы I2C библиотеки
-    i2cdev_done();
+    // Освобождаем ресурсы I2C библиотеки (только если мы её инициализировали)
+    if (s_i2cdev_owned) {
+        i2cdev_done();
+        s_i2cdev_owned = false;
+    }
 
     ESP_LOGI(TAG, "ADS1115 деинициализирован");
 }

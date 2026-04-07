@@ -16,14 +16,14 @@
  *
  * @author HydroNFT Team
  * @version 2.0
- * @date 2024
+ * @date 2026
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -35,10 +35,10 @@
 static const char *TAG = "log_forwarder";
 
 /// Флаг включения/выключения пересылки логов
-static bool s_log_forwarding_enabled = true;
+static _Atomic bool s_log_forwarding_enabled = true;
 
 /// Флаг защиты от рекурсии (когда наш код сам генерирует логи)
-static bool s_inside_log_handler = false;
+static _Atomic bool s_inside_log_handler = false;
 
 /// Буфер для формирования MQTT сообщений (критическая секция)
 static StaticSemaphore_t s_buffer_mutex_storage;
@@ -48,7 +48,7 @@ static SemaphoreHandle_t s_buffer_mutex;
 static char s_log_buffer[512];
 
 /// Время последней отправки лога (для ограничения частоты)
-static int64_t s_last_log_time = 0;
+static _Atomic int64_t s_last_log_time = 0;
 
 /// Минимальный интервал между отправками логов (мс)
 #define LOG_THROTTLE_INTERVAL_MS 200
@@ -157,10 +157,10 @@ static void strip_ansi_codes(char *dst, size_t dst_size, const char *src)
  */
 static int log_vprintf(const char *fmt, va_list args)
 {
-    // Защита от рекурсии: если мы уже внутри обработчика,
-    // просто выводим в UART и выходим
-    if (s_inside_log_handler) {
-        return vprintf(fmt, args);
+    // Защита от рекурсии через атомарный compare-and-swap
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_inside_log_handler, &expected, true)) {
+        return vprintf(fmt, args);  // Уже кто-то внутри — печатаем напрямую
     }
 
     // ВАЖНО: va_list можно использовать только ОДИН раз!
@@ -171,9 +171,10 @@ static int log_vprintf(const char *fmt, va_list args)
     // Выводим в UART (консоль) — используем оригинальный args
     int ret = vprintf(fmt, args);
 
-    // Если пересылка выключена — освобождаем копию и выходим
-    if (!s_log_forwarding_enabled) {
+    // Если пересылка выключена — освобождаем копию, сбрасываем флаг и выходим
+    if (!atomic_load(&s_log_forwarding_enabled)) {
         va_end(args_copy);
+        atomic_store(&s_inside_log_handler, false);
         return ret;
     }
 
@@ -188,27 +189,28 @@ static int log_vprintf(const char *fmt, va_list args)
 
     // Пропускаем всё кроме WARNING и ERROR
     if (level != 'W' && level != 'E') {
+        atomic_store(&s_inside_log_handler, false);
         return ret;
     }
 
     // Ограничение частоты отправки логов (throttling)
     int64_t now = esp_timer_get_time() / 1000; // мс
-    if (now - s_last_log_time < LOG_THROTTLE_INTERVAL_MS) {
+    int64_t last_time = atomic_load(&s_last_log_time);
+    if (now - last_time < LOG_THROTTLE_INTERVAL_MS) {
+        atomic_store(&s_inside_log_handler, false);
         return ret;
     }
-    s_last_log_time = now;
+    atomic_store(&s_last_log_time, now);
 
     // Проверяем подключение к MQTT
     if (!mqtt_client_is_connected()) {
+        atomic_store(&s_inside_log_handler, false);
         return ret;
     }
 
     // Формируем сообщение для MQTT (защищаем мьютексом)
     // Используем xSemaphoreTake с таймаутом 0 — не блокируемся
     if (xSemaphoreTake(s_buffer_mutex, 0) == pdTRUE) {
-        // Устанавливаем флаг рекурсии
-        s_inside_log_handler = true;
-
         // Очищаем ANSI escape-коды для чистого текста в MQTT
         strip_ansi_codes(s_log_buffer, sizeof(s_log_buffer), temp_buf);
 
@@ -218,11 +220,11 @@ static int log_vprintf(const char *fmt, va_list args)
             esp_mqtt_client_publish(client, LOG_MQTT_TOPIC, s_log_buffer, 0, 1, 0);
         }
 
-        // Снимаем флаг рекурсии
-        s_inside_log_handler = false;
-
         xSemaphoreGive(s_buffer_mutex);
     }
+
+    // Снимаем флаг рекурсии
+    atomic_store(&s_inside_log_handler, false);
 
     return ret;
 }
@@ -231,11 +233,9 @@ static int log_vprintf(const char *fmt, va_list args)
  * @brief Отправка MQTT Discovery конфигурации для сенсора логов
  *
  * Регистрирует сенсор логов в Home Assistant через MQTT Discovery.
- * После этого HA автоматически создаст entity sensor.hydronft_log.
- *
- * @note Вызывается при подключении к MQTT
+ * Вызывается из mqtt_client при первом подключении.
  */
-static void log_forwarder_send_discovery(void)
+void log_forwarder_send_discovery(void)
 {
     esp_mqtt_client_handle_t client = (esp_mqtt_client_handle_t)mqtt_client_get_handle();
     if (client == NULL) {
@@ -261,35 +261,10 @@ static void log_forwarder_send_discovery(void)
 }
 
 /**
- * @brief Задача ожидания подключения MQTT и отправки Discovery
- *
- * Ждёт подключения к MQTT и отправляет Discovery конфигурацию.
- * После отправки задача удаляет себя.
- *
- * @param pvParameters Параметры задачи (не используются)
- */
-static void log_forwarder_discovery_task(void *pvParameters)
-{
-    // Ждём подключения к MQTT (максимум 60 секунд)
-    for (int i = 0; i < 60; i++) {
-        if (mqtt_client_is_connected()) {
-            log_forwarder_send_discovery();
-            ESP_LOGI(TAG, "MQTT Discovery для логов отправлен");
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    // Задача больше не нужна — удаляем
-    vTaskDelete(NULL);
-}
-
-/**
  * @brief Инициализация компонента пересылки логов
  *
  * 1. Создаёт мьютекс для защиты буфера
  * 2. Устанавливает кастомную функцию вывода логов
- * 3. Запускает задачу отправки MQTT Discovery
  *
  * @note Вызывать ПОСЛЕ mqtt_client_init()
  */
@@ -297,30 +272,14 @@ void log_forwarder_init(void)
 {
     ESP_LOGI(TAG, "Инициализация пересылки логов в MQTT");
 
-    // Создаём мьютекс для защиты буфера
+    // Создаём мьютекс для защиты буфера (статическое выделение — не может вернуть NULL)
     s_buffer_mutex = xSemaphoreCreateMutexStatic(&s_buffer_mutex_storage);
-    if (s_buffer_mutex == NULL) {
-        ESP_LOGE(TAG, "Не удалось создать мьютекс буфера");
-        return;
-    }
 
     // Устанавливаем кастомную функцию вывода логов
     esp_log_set_vprintf(log_vprintf);
 
     ESP_LOGI(TAG, "Пересылка WARNING и ERROR логов в MQTT включена");
     ESP_LOGI(TAG, "Топик: %s", LOG_MQTT_TOPIC);
-
-    // Запускаем задачу для отправки MQTT Discovery конфигурации
-    // (нужно дождаться подключения к MQTT)
-    // Стек: 3072 байт - ESP_LOGI, mqtt_client_publish, json буферы, запас 3×
-    xTaskCreate(
-        log_forwarder_discovery_task,
-        "log_disc_task",
-        3072,
-        NULL,
-        2,  // Низкий приоритет
-        NULL
-    );
 }
 
 /**
@@ -328,7 +287,7 @@ void log_forwarder_init(void)
  */
 void log_forwarder_enable(bool enable)
 {
-    s_log_forwarding_enabled = enable;
+    atomic_store(&s_log_forwarding_enabled, enable);
     ESP_LOGI(TAG, "Пересылка логов %s", enable ? "включена" : "выключена");
 }
 
@@ -337,5 +296,5 @@ void log_forwarder_enable(bool enable)
  */
 bool log_forwarder_is_enabled(void)
 {
-    return s_log_forwarding_enabled;
+    return atomic_load(&s_log_forwarding_enabled);
 }

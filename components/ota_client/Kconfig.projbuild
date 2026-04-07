@@ -1,26 +1,26 @@
-menu "OTA Client Configuration"
+menu "Настройки OTA обновления"
 
-config EXAMPLE_FIRMWARE_UPG_URL
-    string "Firmware Upgrade URL"
-    default "https://example.com/firmware.bin"
-    help
-        URL для загрузки прошивки
+    config EXAMPLE_FIRMWARE_UPG_URL
+        string "URL прошивки"
+        default "https://example.com/firmware.bin"
+        help
+            HTTPS URL для загрузки новой прошивки.
 
-config EXAMPLE_OTA_RECV_TIMEOUT
-    int "OTA Receive Timeout (ms)"
-    default 60000
-    help
-        Таймаут получения данных OTA (увеличен до 60 сек для медленного Wi-Fi)
+    config EXAMPLE_OTA_RECV_TIMEOUT
+        int "Таймаут получения данных (мс)"
+        default 60000
+        help
+            Таймаут получения данных OTA в миллисекундах.
+            Увеличьте при медленном Wi-Fi соединении.
 
-config EXAMPLE_GPIO_DIAGNOSTIC
-    int "GPIO for Diagnostic"
-    default 34
-    help
-        GPIO пин для диагностики после OTA.
+    config EXAMPLE_GPIO_DIAGNOSTIC
+        int "GPIO пин диагностики"
+        default 34
+        help
+            GPIO пин для проверки работоспособности после OTA обновления.
 
-        WARNING: Не используйте GPIO 0 (BOOT кнопка) или GPIO 2 (встроенный LED).
-        Рекомендуется использовать GPIO 34, 35, 36, 39 (только вход, нет подтяжек).
-
-        По умолчанию GPIO 34 - вход без подтяжки, конфликт с BOOT исключён.
+            Внимание: не используйте GPIO 0 (кнопка BOOT) или GPIO 2 (встроенный LED).
+            Рекомендуемые пины: GPIO 34, 35, 36, 39 — только вход, без внутренних подтяжек.
+            По умолчанию GPIO 34.
 
 endmenu

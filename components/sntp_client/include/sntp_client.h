@@ -34,12 +34,11 @@
  * @endcode
  *
  * @author HydroNFT Team
- * @version 1.0
- * @date 2024
+ * @version 2.0
+ * @date 2026
  */
 
-#ifndef SNTP_CLIENT_H
-#define SNTP_CLIENT_H
+#pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -172,5 +171,3 @@ time_t sntp_client_get_timestamp(void);
 #ifdef __cplusplus
 }
 #endif
-
-#endif // SNTP_CLIENT_H

@@ -197,6 +197,34 @@ void device_control_ads1115_stop_for_ota(void);
  */
 bool device_control_ads1115_is_stop_requested(void);
 
+/**
+ * @brief Настроить pull-up резистор для пина DHT
+ * @param enable true = включить внутренний pull-up, false = floating (внешний pull-up)
+ *
+ * @note Вызывается из main.c вместо прямого gpio_set_pull_mode
+ * @note GPIO пин берётся из CONFIG_EXAMPLE_DATA_GPIO
+ */
+void device_control_set_dht_pullup(bool enable);
+
+// ============================================================================
+// БИТЫ EVENTGROUP ДЛЯ СИНХРОНИЗАЦИИ ЗАДАЧ РАСПИСАНИЯ
+// ============================================================================
+// Единственный источник истины — device_control.h.
+// Используется и в device_control.c (xEventGroupSetBits)
+// и в main.c (xEventGroupWaitBits). Изменяйте только здесь.
+// ============================================================================
+
+#include "freertos/event_groups.h"
+
+/// Бит: получен флаг OTA обновления из MQTT
+#define DEVICE_CTRL_OTA_FLAG_BIT        BIT1
+
+/// Бит: режим изменён — для light_schedule_task (отдельный, чтобы не конфликтовать)
+#define DEVICE_CTRL_LIGHT_MODE_BIT      BIT2
+
+/// Бит: режим изменён — для pump_valve_schedule_task (отдельный, чтобы не конфликтовать)
+#define DEVICE_CTRL_PUMP_MODE_BIT       BIT3
+
 // ============================================================================
 // СИГНАЛИЗАЦИЯ ЗАДАЧ РАСПИСАНИЯ (EventGroup)
 // ============================================================================
@@ -223,29 +251,6 @@ void device_control_notify_mode_changed(void);
  * Вызывается из mqtt_client при получении команды OTA START.
  */
 void device_control_notify_ota_flag(void);
-
-// ============================================================================
-// CALLBACK ИЗМЕНЕНИЯ СОСТОЯНИЯ GPIO
-// ============================================================================
-
-/**
- * @brief Тип callback-функции при изменении состояния GPIO
- * @param topic MQTT топик для публикации состояния
- * @param state true = включено, false = выключено
- *
- * @note Вызывается после каждого gpio_set_level() в device_control
- * @note Callback вызывается в контексте вызывающей задачи (не ISR)
- */
-typedef void (*device_state_change_cb_t)(const char *topic, bool state);
-
-/**
- * @brief Зарегистрировать callback для уведомления об изменении GPIO
- * @param cb Callback-функция или NULL для отмены
- *
- * @note Вызывается из mqtt_client при подключении к MQTT
- * @note Только один callback может быть зарегистрирован одновременно
- */
-void device_control_register_state_cb(device_state_change_cb_t cb);
 
 #ifdef __cplusplus
 }

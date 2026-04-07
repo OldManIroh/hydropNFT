@@ -29,6 +29,11 @@ static float s_dht_temperature = 0.0f;
 static float s_dht_humidity = 0.0f;
 static bool s_dht_data_valid = false;
 
+/// Кэшированное состояние GPIO (надёжнее gpio_get_level() на output-пинах)
+static _Atomic bool s_pump_state = false;
+static _Atomic bool s_light_state = false;
+static _Atomic bool s_valve_state = false;
+
 /// Единый режим работы системы (по умолчанию MANUAL — безопасный режим после перезагрузки)
 static _Atomic device_mode_t s_mode = DEVICE_MODE_MANUAL;
 
@@ -36,7 +41,7 @@ static _Atomic device_mode_t s_mode = DEVICE_MODE_MANUAL;
 static _Atomic bool s_ads1115_stop_requested = false;
 
 /// Callback для уведомления об изменении состояния GPIO
-static device_state_change_cb_t s_state_cb = NULL;
+static _Atomic device_state_change_cb_t s_state_cb = NULL;
 
 // ============================================================================
 // ИНИЦИАЛИЗАЦИЯ
@@ -85,6 +90,7 @@ esp_err_t device_control_init(void)
     err = gpio_config(&light_io_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Ошибка конфигурации GPIO света: %s", esp_err_to_name(err));
+        gpio_reset_pin(DEVICE_CONTROL_PUMP_PIN);  // Откат
         return err;
     }
 
@@ -99,6 +105,8 @@ esp_err_t device_control_init(void)
     err = gpio_config(&valve_io_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Ошибка конфигурации GPIO клапана: %s", esp_err_to_name(err));
+        gpio_reset_pin(DEVICE_CONTROL_PUMP_PIN);   // Откат
+        gpio_reset_pin(DEVICE_CONTROL_LIGHT_PIN);  // Откат
         return err;
     }
 
@@ -121,38 +129,57 @@ esp_err_t device_control_init(void)
 
 void device_control_set_pump_state(bool state)
 {
+    // Защита от вызова до инициализации GPIO
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "device_control не инициализирован — команда насоса проигнорирована");
+        return;
+    }
+    atomic_store(&s_pump_state, state);
     gpio_set_level(DEVICE_CONTROL_PUMP_PIN, state ? 1 : 0);
     ESP_LOGI(TAG, "Насос: %s", state ? "ВКЛ" : "ВЫКЛ");
-    if (s_state_cb) s_state_cb("hydro/switch/pump/state", state);
+    device_state_change_cb_t cb = atomic_load(&s_state_cb);
+    if (cb) cb("hydro/switch/pump/state", state);
 }
 
 void device_control_set_light_state(bool state)
 {
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "device_control не инициализирован — команда света проигнорирована");
+        return;
+    }
+    atomic_store(&s_light_state, state);
     gpio_set_level(DEVICE_CONTROL_LIGHT_PIN, state ? 1 : 0);
     ESP_LOGI(TAG, "Свет: %s", state ? "ВКЛ" : "ВЫКЛ");
-    if (s_state_cb) s_state_cb("hydro/switch/light/state", state);
+    device_state_change_cb_t cb = atomic_load(&s_state_cb);
+    if (cb) cb("hydro/switch/light/state", state);
 }
 
 void device_control_set_valve_state(bool state)
 {
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "device_control не инициализирован — команда клапана проигнорирована");
+        return;
+    }
+    atomic_store(&s_valve_state, state);
     gpio_set_level(DEVICE_CONTROL_VALVE_PIN, state ? 1 : 0);
     ESP_LOGI(TAG, "Клапан: %s", state ? "ОТКРЫТ" : "ЗАКРЫТ");
-    if (s_state_cb) s_state_cb("hydro/switch/valve/state", state);
+    device_state_change_cb_t cb = atomic_load(&s_state_cb);
+    if (cb) cb("hydro/switch/valve/state", state);
 }
 
 bool device_control_get_pump_state(void)
 {
-    return gpio_get_level(DEVICE_CONTROL_PUMP_PIN);
+    return atomic_load(&s_pump_state);
 }
 
 bool device_control_get_light_state(void)
 {
-    return gpio_get_level(DEVICE_CONTROL_LIGHT_PIN);
+    return atomic_load(&s_light_state);
 }
 
 bool device_control_get_valve_state(void)
 {
-    return gpio_get_level(DEVICE_CONTROL_VALVE_PIN);
+    return atomic_load(&s_valve_state);
 }
 
 // ============================================================================
@@ -184,6 +211,11 @@ device_mode_t device_control_mode_from_string(const char *str)
     if (strcmp(str, "manual") == 0) {
         return DEVICE_MODE_MANUAL;
     }
+    if (strcmp(str, "auto") == 0) {
+        return DEVICE_MODE_AUTO;
+    }
+    // Логируем неизвестные значения вместо тихого fallback на AUTO
+    ESP_LOGW(TAG, "Неизвестный режим '%s', использую AUTO", str);
     return DEVICE_MODE_AUTO;
 }
 
@@ -193,7 +225,7 @@ device_mode_t device_control_mode_from_string(const char *str)
 
 void device_control_register_state_cb(device_state_change_cb_t cb)
 {
-    s_state_cb = cb;
+    atomic_store(&s_state_cb, cb);
 }
 
 // ============================================================================
@@ -260,29 +292,44 @@ bool device_control_ads1115_is_stop_requested(void)
 }
 
 // ============================================================================
+// НАСТРОЙКА PULL-UP ДЛЯ DHT
+// ============================================================================
+
+void device_control_set_dht_pullup(bool enable)
+{
+    gpio_pull_mode_t mode = enable ? GPIO_PULLUP_ONLY : GPIO_FLOATING;
+    gpio_set_pull_mode(CONFIG_EXAMPLE_DATA_GPIO, mode);
+    ESP_LOGI(TAG, "DHT pull-up: %s", enable ? "ВКЛ" : "ВЫКЛ");
+}
+
+// ============================================================================
 // СИГНАЛИЗАЦИЯ ЗАДАЧ РАСПИСАНИЯ (EventGroup)
 // ============================================================================
 
-static EventGroupHandle_t s_schedule_event = NULL;
+/// Атомарный указатель на EventGroup (безопасный доступ из разных задач)
+static _Atomic EventGroupHandle_t s_schedule_event = NULL;
 
-#define SCHEDULE_MODE_CHANGED_BIT    BIT0
-#define SCHEDULE_OTA_FLAG_BIT        BIT1
+// Биты EventGroup определены в device_control.h
 
 void device_control_set_schedule_event(void *event)
 {
-    s_schedule_event = (EventGroupHandle_t)event;
+    atomic_store(&s_schedule_event, (EventGroupHandle_t)event);
 }
 
 void device_control_notify_mode_changed(void)
 {
-    if (s_schedule_event != NULL) {
-        xEventGroupSetBits(s_schedule_event, SCHEDULE_MODE_CHANGED_BIT);
+    EventGroupHandle_t evt = atomic_load(&s_schedule_event);
+    if (evt != NULL) {
+        xEventGroupSetBits(evt,
+            DEVICE_CTRL_LIGHT_MODE_BIT |
+            DEVICE_CTRL_PUMP_MODE_BIT);
     }
 }
 
 void device_control_notify_ota_flag(void)
 {
-    if (s_schedule_event != NULL) {
-        xEventGroupSetBits(s_schedule_event, SCHEDULE_OTA_FLAG_BIT);
+    EventGroupHandle_t evt = atomic_load(&s_schedule_event);
+    if (evt != NULL) {
+        xEventGroupSetBits(evt, DEVICE_CTRL_OTA_FLAG_BIT);
     }
 }

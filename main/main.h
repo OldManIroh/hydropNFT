@@ -74,13 +74,9 @@ void mqtt_ota_progress_task(void *pvParameters);
 
 /**
  * @brief Запуск задачи публикации прогресса OTA
+ * @note Задача завершает себя сама после окончания OTA сессии
  */
 void start_ota_progress_task(void);
-
-/**
- * @brief Остановка задачи публикации прогресса OTA
- */
-void stop_ota_progress_task(void);
 
 #ifdef __cplusplus
 }

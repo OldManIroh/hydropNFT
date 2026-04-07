@@ -53,12 +53,11 @@
  * @endcode
  * 
  * @author HydroNFT Team
- * @version 1.0
- * @date 2024
+ * @version 2.0
+ * @date 2026
  */
 
-#ifndef OTA_CLIENT_H
-#define OTA_CLIENT_H
+#pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -209,8 +208,12 @@ int ota_get_total_size(void);
  */
 int ota_get_downloaded_bytes(void);
 
+/**
+ * @brief Проверить, активна ли OTA сессия
+ * @return true если OTA обновление запущено (даже если загрузка ещё не началась)
+ */
+bool ota_is_active(void);
+
 #ifdef __cplusplus
 }
 #endif
-
-#endif // OTA_CLIENT_H
