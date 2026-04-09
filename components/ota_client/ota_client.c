@@ -1,6 +1,41 @@
 /*
  * ============================================================================
- * OTA Client Component — Компонент OTA-обновления для ESP32
+ * OTA Client Component — Обновление прошивки "по воздуху" для ESP32
+ * ============================================================================
+ *
+ * @par Архитектура разделов flash
+ * +------------------+
+ * | Bootloader       | 0x1000
+ * +------------------+
+ * | Partition Table  | 0x8000
+ * +------------------+
+ * | OTA_0 (app)      | 0x10000  <- Текущая прошивка
+ * +------------------+
+ * | OTA_1 (app)      |          <- Резервная/обновляемая
+ * +------------------+
+ * | NVS (data)       |          <- Настройки, Wi-Fi креды
+ * +------------------+
+ *
+ * @par Процесс OTA обновления
+ * 1. MQTT/Web шлёт команду → ota_start_task() создаёт задачу
+ * 2. s_ota_active = true (ДО создания задачи — предотвращает повторный запуск)
+ * 3. Загрузка прошивки порциями по 1024 байт через HTTPS
+ * 4. Проверка заголовка — если версия совпадает → abort без перезагрузки
+ * 5. Проверка на invalid partition → откат если та же версия что и последняя неудачная
+ * 6. esp_ota_begin → esp_ota_write → esp_ota_end → esp_ota_set_boot_partition
+ * 7. esp_restart() → bootloader грузит новый раздел
+ * 8. ota_check_and_diagnose() проверяет ESP_OTA_IMG_PENDING_VERIFY
+ * 9. Диагностика GPIO (5 сек) → esp_ota_mark_app_valid_cancel_rollback()
+ *    ИЛИ esp_ota_mark_app_invalid_rollback_and_reboot()
+ *
+ * @par Безопасность при OTA
+ * Перед записью во flash:
+ * - Отключаются насос, свет, клапан (реле могут быть в неопределённом состоянии)
+ * - ADS1115 задача удаляется (I2C шина может конфликтовать с SPI flash записью)
+ *
+ * @author HydroNFT Team
+ * @version 2.0
+ * @date 2026
  * ============================================================================
  */
 
@@ -20,7 +55,6 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
-#include "protocol_examples_common.h"
 #include "errno.h"
 #include "ota_client.h"
 #include "hydro_mqtt_client.h"  // Для публикации статуса OTA и версии прошивки
@@ -34,7 +68,6 @@
 
 #define BUFFSIZE 1024
 #define HASH_LEN 32
-#define OTA_URL_SIZE 256
 
 static const char *TAG = "ota_client";
 
@@ -61,19 +94,19 @@ static void http_cleanup(esp_http_client_handle_t client)
  *
  * @param ota_status Строка статуса для MQTT или NULL (не публиковать)
  *
- * @note Вызывающая сторона должна залогировать причину перезагрузки ДО вызова
+ * @note Функция НЕ ВОЗВРАЩАЕТ управление — вызов esp_restart() завершает процесс
+ * @note __attribute__((noreturn)) подсказывает компилятору что код после вызова недостижим
  */
-static void ota_restart_helper(const char *ota_status)
+__attribute__((noreturn)) static void ota_restart_helper(const char *ota_status)
 {
     if (ota_status) {
         mqtt_client_publish_ota_status(ota_status);
     }
     ESP_LOGW(TAG, "Перезагрузка через 5 секунд...");
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(5000));
     esp_task_wdt_delete(NULL);
     esp_restart();
-    // На случай если esp_restart() не сработал
-    while (1) { vTaskDelay(1); }
+    // esp_restart() не возвращает — код ниже недостижим
 }
 
 /**
@@ -88,7 +121,7 @@ static void ota_restart_helper(const char *ota_status)
  *
  * @note Функция не возвращает управление - устройство будет перезапущено
  */
-static void task_fatal_error(void)
+__attribute__((noreturn)) static void task_fatal_error(void)
 {
     ESP_LOGE(TAG, "Фатальная ошибка OTA - перезагрузка устройства...");
     ota_restart_helper("fatal_error");
@@ -162,7 +195,9 @@ static void ota_task(void *pvParameter)
     ESP_LOGI(TAG, "Запуск задачи OTA-обновления");
 
     // Добавляем эту задачу в TWDT для предотвращения перезагрузки по watchdog
-    esp_task_wdt_add(NULL);
+    if (esp_task_wdt_add(NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "Не удалось добавить OTA задачу в watchdog");
+    }
 
     // Публикуем текущую версию прошивки
     esp_app_desc_t running_app_info;
@@ -210,12 +245,18 @@ static void ota_task(void *pvParameter)
         task_fatal_error();
     }
     
-    // Получаем длину файла из HTTP заголовков
+    // Получаем длину файла из HTTP заголовков.
+    // esp_http_client_fetch_headers() может вернуть -1 при ошибке (нет заголовка Content-Length).
+    // НЕ сохраняем отрицательное значение в s_ota_total_bytes — иначе прогресс
+    // (downloaded * 100) / (size_t)-1 даст garbage (огромное число).
     int total = esp_http_client_fetch_headers(client);
-    atomic_store(&s_ota_total_bytes, total);
-    if (total > 0) {
-        ESP_LOGI(TAG, "Размер прошивки: %d байт (%.2f KB)", total, total / 1024.0);
+    if (total <= 0) {
+        ESP_LOGE(TAG, "Не удалось определить размер прошивки (total=%d) — отмена OTA", total);
+        http_cleanup(client);
+        task_fatal_error();
     }
+    atomic_store(&s_ota_total_bytes, total);
+    ESP_LOGI(TAG, "Размер прошивки: %d байт (%.2f KB)", total, total / 1024.0);
 
     update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
@@ -314,11 +355,12 @@ static void ota_task(void *pvParameter)
                 else {
                     ESP_LOGE(TAG, "Полученный пакет не соответствует ожидаемому размеру");
                     http_cleanup(client);
-                    // esp_ota_abort не вызываем — update_handle == 0 (UB)
                     task_fatal_error();
+                    // task_fatal_error() вызывает esp_restart() и не возвращается
                 }
             }
 
+            // update_handle гарантированно != 0 здесь (установлен в esp_ota_begin выше)
             err = esp_ota_write(update_handle, (const void *)ota_write_data, data_read);
             if (err != ESP_OK) {
                 http_cleanup(client);
@@ -452,7 +494,7 @@ bool ota_diagnostic(void)
     }
 
     ESP_LOGI(TAG, "Диагностика (5 сек)...");
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(5000));
 
     bool diagnostic_is_ok = gpio_get_level(CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
     gpio_reset_pin(CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
@@ -464,21 +506,24 @@ void ota_check_and_diagnose(void)
     ESP_LOGI(TAG, "Проверка состояния прошивки");
 
     uint8_t sha_256[HASH_LEN] = {0};
-    // memset гарантирует что поля flash_chip, label, encrypted не содержат мусор
-    esp_partition_t partition;
-    memset(&partition, 0, sizeof(partition));
 
-    partition.address = ESP_PARTITION_TABLE_OFFSET;
-    partition.size = ESP_PARTITION_TABLE_MAX_LEN;
-    partition.type = ESP_PARTITION_TYPE_DATA;
-    esp_partition_get_sha256(&partition, sha_256);
-    print_sha256(sha_256, "SHA-256 для таблицы разделов");
+    // SHA-256 таблицы разделов — используем esp_partition_find_first
+    const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, NULL);
+    if (part != NULL) {
+        esp_partition_get_sha256(part, sha_256);
+        print_sha256(sha_256, "SHA-256 для раздела NVS");
+    }
 
-    partition.address = ESP_BOOTLOADER_OFFSET;
-    partition.size = ESP_PARTITION_TABLE_OFFSET;
-    partition.type = ESP_PARTITION_TYPE_APP;
-    esp_partition_get_sha256(&partition, sha_256);
-    print_sha256(sha_256, "SHA-256 для загрузчика");
+    // SHA-256 загрузчика
+    part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    if (part == NULL) {
+        // Factory может отсутствовать — ищем первый app
+        part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    }
+    if (part != NULL) {
+        esp_partition_get_sha256(part, sha_256);
+        print_sha256(sha_256, "SHA-256 для загрузочного раздела");
+    }
 
     esp_partition_get_sha256(esp_ota_get_running_partition(), sha_256);
     print_sha256(sha_256, "SHA-256 для текущей прошивки");
@@ -502,9 +547,9 @@ void ota_check_and_diagnose(void)
 
 void ota_init(void)
 {
-    ESP_LOGI(TAG, "Инициализация NVS и сети");
+    ESP_LOGI(TAG, "Инициализация NVS");
 
-    // Пункт 3.2: Улучшенная обработка сбоя питания при записи в NVS
+    // Инициализация NVS с восстановлением при ошибках
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "NVS требует очистки (переполнение или новая версия). Предыдущие данные будут потеряны.");
@@ -512,41 +557,31 @@ void ota_init(void)
         err = nvs_flash_init();
     }
     if (err != ESP_OK) {
-        // Критическая ошибка NVS — пробуем восстановление
         ESP_LOGE(TAG, "Критическая ошибка NVS: %s. Попытка восстановления...", esp_err_to_name(err));
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
         ESP_LOGI(TAG, "NVS восстановлен");
     }
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(example_connect());
-
-#if CONFIG_EXAMPLE_CONNECT_WIFI
-    esp_wifi_set_ps(WIFI_PS_NONE);
-#endif
 }
 
-void ota_start_task(void)
+esp_err_t ota_start_task(void)
 {
-    // Защита от повторного запуска OTA
-    if (atomic_load(&s_ota_active)) {
+    // Атомарная попытка захватить право на запуск OTA — предотвращает race condition
+    // между двумя одновременными вызовами (например, MQTT + веб-интерфейс)
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_ota_active, &expected, true)) {
         ESP_LOGW(TAG, "OTA уже выполняется, игнорирую команду");
-        return;
+        return ESP_ERR_INVALID_STATE;
     }
-    
-    // Устанавливаем флаг ДО создания задачи — закрываем race condition
-    // между проверкой в ota_start_task() и установкой внутри ota_task()
-    atomic_store(&s_ota_active, true);
-    
+
     BaseType_t res = xTaskCreatePinnedToCore(&ota_task, "ota_task", 8192, NULL, 5, NULL, PRO_CPU_NUM);
     if (res != pdPASS) {
         ESP_LOGE(TAG, "Не удалось создать задачу OTA: %d", res);
         atomic_store(&s_ota_active, false);
         mqtt_client_publish_ota_status("failed");
-        return;
+        return ESP_ERR_NO_MEM;
     }
-    
+
     ESP_LOGI(TAG, "Задача OTA создана успешно");
+    return ESP_OK;
 }

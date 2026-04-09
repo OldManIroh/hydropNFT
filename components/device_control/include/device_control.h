@@ -18,16 +18,17 @@
 
 #include <stdbool.h>
 #include <esp_err.h>
+#include "freertos/event_groups.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/// @brief GPIO пины для управления оборудованием
+/// @brief GPIO пины для управления оборудованием (настраиваются через menuconfig)
 /// @{
-#define DEVICE_CONTROL_PUMP_PIN   19  ///< Насос циркуляции воды
-#define DEVICE_CONTROL_LIGHT_PIN  18  ///< Фитолампа освещения
-#define DEVICE_CONTROL_VALVE_PIN  4   ///< Электроклапан слива/подачи
+#define DEVICE_CONTROL_PUMP_PIN   CONFIG_PUMP_GPIO    ///< Насос циркуляции воды
+#define DEVICE_CONTROL_LIGHT_PIN  CONFIG_LIGHT_GPIO   ///< Фитолампа освещения
+#define DEVICE_CONTROL_VALVE_PIN  CONFIG_VALVE_GPIO   ///< Электроклапан слива/подачи
 /// @}
 
 /**
@@ -213,8 +214,6 @@ void device_control_set_dht_pullup(bool enable);
 // Используется и в device_control.c (xEventGroupSetBits)
 // и в main.c (xEventGroupWaitBits). Изменяйте только здесь.
 // ============================================================================
-
-#include "freertos/event_groups.h"
 
 /// Бит: получен флаг OTA обновления из MQTT
 #define DEVICE_CTRL_OTA_FLAG_BIT        BIT1

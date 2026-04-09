@@ -1,17 +1,25 @@
 /**
  * @file mqtt_client.c
- * @brief MQTT клиент для HydroNFT проекта
- * 
- * Этот модуль реализует MQTT клиент для подключения к Home Assistant
- * и управления устройством через MQTT протокол.
- * 
- * Функционал:
- * - Подключение к MQTT брокеру
- * - Home Assistant MQTT Discovery (автоматическое обнаружение устройств)
- * - Управление выключателями (насос, свет)
- * - Публикация данных сенсоров (pH, TDS, уровень воды)
- * - Поддержка OTA обновлений через MQTT команду
- * 
+ * @brief MQTT клиент для HydroNFT
+ *
+ * @par Архитектура
+ * - Один esp_mqtt_client с обработчиком событий (MQTT_EVENT_*)
+ * - HA Discovery отправляется ОДИН РАЗ при первом подключении (retain=1 на брокере)
+ * - При reconnect — только подписки и состояния (не дублируем discovery)
+ * - s_discovery_sent сбрасывается при disconnect — HA может потерять конфигурацию
+ *   если брокер не сохранил retain=1 сообщения
+ *
+ * @par Поток OTA из MQTT
+ * 1. HA шлёт "START" в hydro/ota/update
+ * 2. MQTT handler ставит ota_update_requested = true
+ * 3. mqtt_ota_check_task (main.c) проверяет флаг, запускает ota_start_task()
+ * 4. OTA задача грузит прошивку, перезагружает устройство
+ *
+ * @par Безопасность
+ * - Буферы uri/user/pass — static (не стек) — esp_mqtt_client_init копирует строки,
+ *   но static защищает от будущих изменений ESP-IDF и от use-after-free при restart
+ * - Discovery payload проверяется на truncation — не публикуем невалидный JSON
+ *
  * @author HydroNFT Team
  * @version 2.0
  * @date 2026
@@ -35,6 +43,7 @@
 #include "ads1115.h"               // Для получения данных с ADS1115
 #include "sntp_client.h"           // Для проверки синхронизации времени
 #include "log_forwarder.h"         // Для discovery сенсора логов
+#include "settings.h"              // Для настроек из NVS
 
 /// Тег для системы логирования ESP-IDF
 static const char *TAG = "mqtt_client";
@@ -47,9 +56,6 @@ static const char *HA_DEVICE_BLOCK =
     "\"model\":\"ESP32\","
     "\"manufacturer\":\"HydroNFT\""
     "}";
-
-/// Максимальное напряжение TDS датчика при 1000 ppm
-static const float TDS_MAX_VOLTAGE_V = 2.3f;
 
 /// Дескриптор MQTT клиента - используется для всех операций с MQTT
 static esp_mqtt_client_handle_t mqtt_client;
@@ -65,7 +71,7 @@ static _Atomic bool ota_update_requested = false;
 static bool s_time_published = false;
 
 /// Флаг однократной отправки HA discovery конфигураций (retain=1, не нужно повторять при reconnect)
-static bool s_discovery_sent = false;
+static _Atomic bool s_discovery_sent = false;
 
 
 // ============================================================================
@@ -105,7 +111,7 @@ static void send_discovery_sensor(esp_mqtt_client_handle_t client, const char *o
     // Проверяем, есть ли device_class - если пустой, не включаем в JSON
     if (device_class && device_class[0] != '\0') {
         // С device_class
-        snprintf(payload, sizeof(payload),
+        int ret = snprintf(payload, sizeof(payload),
                  "{\"name\":\"%s\","
                  "\"state_topic\":\"%s\","
                  "\"unit_of_measurement\":\"%s\","
@@ -115,9 +121,14 @@ static void send_discovery_sensor(esp_mqtt_client_handle_t client, const char *o
                  "%s}",
                  name, state_topic, unit ? unit : "", device_class, object_id,
                  value_template, HA_DEVICE_BLOCK);
+        if (ret < 0 || (size_t)ret >= sizeof(payload)) {
+            ESP_LOGW(TAG, "Обрезан discovery payload для %s (%d/%zu байт) — пропускаю публикацию",
+                     object_id, ret, sizeof(payload));
+            return;
+        }
     } else {
         // Без device_class (пустое значение)
-        snprintf(payload, sizeof(payload),
+        int ret = snprintf(payload, sizeof(payload),
                  "{\"name\":\"%s\","
                  "\"state_topic\":\"%s\","
                  "\"unit_of_measurement\":\"%s\","
@@ -126,6 +137,11 @@ static void send_discovery_sensor(esp_mqtt_client_handle_t client, const char *o
                  "%s}",
                  name, state_topic, unit ? unit : "", object_id,
                  value_template, HA_DEVICE_BLOCK);
+        if (ret < 0 || (size_t)ret >= sizeof(payload)) {
+            ESP_LOGW(TAG, "Обрезан discovery payload для %s (%d/%zu байт) — пропускаю публикацию",
+                     object_id, ret, sizeof(payload));
+            return;  // Не публикуем невалидный JSON
+        }
     }
 
     // Публикуем конфигурацию с QoS=1 и retain=1
@@ -157,8 +173,8 @@ static void send_discovery_switch(esp_mqtt_client_handle_t client, const char *o
     char payload[512];
 
     snprintf(topic, sizeof(topic), "homeassistant/switch/hydroesp32/%s/config", object_id);
-    
-    snprintf(payload, sizeof(payload),
+
+    int ret = snprintf(payload, sizeof(payload),
              "{\"name\":\"%s\","
              "\"command_topic\":\"%s\","
              "\"state_topic\":\"%s\","
@@ -167,6 +183,10 @@ static void send_discovery_switch(esp_mqtt_client_handle_t client, const char *o
              "\"unique_id\":\"esp32_hydro_%s\","
              "%s}",
              name, command_topic, state_topic, object_id, HA_DEVICE_BLOCK);
+    if (ret < 0 || (size_t)ret >= sizeof(payload)) {
+        ESP_LOGW(TAG, "Обрезан discovery payload для switch %s — пропускаю", object_id);
+        return;
+    }
 
     int msg_id = esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
     ESP_LOGI(TAG, "Отправлена конфигурация выключателя %s, msg_id=%d", object_id, msg_id);
@@ -193,7 +213,7 @@ static void send_discovery_select(esp_mqtt_client_handle_t client, const char *o
 
     snprintf(topic, sizeof(topic), "homeassistant/select/hydroesp32/%s/config", object_id);
 
-    snprintf(payload, sizeof(payload),
+    int ret = snprintf(payload, sizeof(payload),
              "{\"name\":\"%s\","
              "\"command_topic\":\"%s\","
              "\"state_topic\":\"%s\","
@@ -202,6 +222,10 @@ static void send_discovery_select(esp_mqtt_client_handle_t client, const char *o
              "\"icon\":\"mdi:cog\","
              "%s}",
              name, command_topic, state_topic, object_id, HA_DEVICE_BLOCK);
+    if (ret < 0 || (size_t)ret >= sizeof(payload)) {
+        ESP_LOGW(TAG, "Обрезан discovery payload для select %s — пропускаю", object_id);
+        return;
+    }
 
     int msg_id = esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
     ESP_LOGI(TAG, "Отправлена конфигурация селектора %s, msg_id=%d", object_id, msg_id);
@@ -231,7 +255,7 @@ static void send_discovery_button(esp_mqtt_client_handle_t client, const char *o
     snprintf(topic, sizeof(topic), "homeassistant/button/hydroesp32/%s/config", object_id);
 
     // JSON конфигурации кнопки
-    snprintf(payload_json, sizeof(payload_json),
+    int ret = snprintf(payload_json, sizeof(payload_json),
              "{\"name\":\"%s\","
              "\"command_topic\":\"%s\","
              "\"payload_press\":\"%s\","
@@ -240,6 +264,10 @@ static void send_discovery_button(esp_mqtt_client_handle_t client, const char *o
              "\"entity_category\":\"diagnostic\","
              "%s}",
              name, command_topic, payload, object_id, HA_DEVICE_BLOCK);
+    if (ret < 0 || (size_t)ret >= sizeof(payload_json)) {
+        ESP_LOGW(TAG, "Обрезан discovery payload для кнопки %s — пропускаю", object_id);
+        return;
+    }
 
     // WDT-1: esp_mqtt_client_publish может блокироваться - не используем в критичных местах
     int msg_id = esp_mqtt_client_publish(client, topic, payload_json, 0, 1, 1);
@@ -396,6 +424,11 @@ static void on_device_state_changed(const char *topic, bool state)
 static void handle_switch_command(const char *data, const char *device_name,
                                   void (*set_state)(bool))
 {
+    if (set_state == NULL) {
+        ESP_LOGE(TAG, "handle_switch_command: set_state callback NULL для %s", device_name);
+        return;
+    }
+
     if (strcmp(data, "ON") == 0) {
         ESP_LOGI(TAG, "%s: ВКЛ", device_name);
         set_state(true);
@@ -409,7 +442,9 @@ static void handle_switch_command(const char *data, const char *device_name,
     // Переключаем в MANUAL только если ещё не в нём — избегаем избыточных публикаций и wakeup'ов
     if (device_control_get_mode() != DEVICE_MODE_MANUAL) {
         device_control_set_mode(DEVICE_MODE_MANUAL);
-        esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", "manual", 0, 1, 0);
+        if (mqtt_client != NULL) {
+            esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", "manual", 0, 1, 0);
+        }
         device_control_notify_mode_changed();
     }
 }
@@ -450,7 +485,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             atomic_store(&mqtt_connected, true);
 
             // HA Discovery отправляем только один раз (конфигурации с retain=1 сохраняются на брокере)
-            if (!s_discovery_sent) {
+            if (!atomic_load(&s_discovery_sent)) {
                 // === Сенсоры (единый JSON-топик hydro/sensor/data, value_template для извлечения полей) ===
                 // 1. Уровень воды
                 send_discovery_sensor(mqtt_client, "water_level", "Уровень воды", "%", "",
@@ -508,7 +543,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     ESP_LOGI(TAG, "Отправлена конфигурация touch-сенсора");
                 }
 
-                s_discovery_sent = true;
+                atomic_store(&s_discovery_sent, true);
                 ESP_LOGI(TAG, "HA Discovery конфигурации отправлены (больше не повторяются при reconnect)");
 
                 // Лог-сенсор из log_forwarder
@@ -580,6 +615,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "MQTT отключён. Автоматическое переподключение...");
             atomic_store(&mqtt_connected, false);
+            // Сбрасываем флаг discovery — при следующем подключении HA может не иметь конфигурации
+            atomic_store(&s_discovery_sent, false);
+            // Сбрасываем флаг публикации времени — при повторной синхронизации NTP нужно опубликовать
+            s_time_published = false;
             break;
 
         // ================================================================
@@ -587,18 +626,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // ================================================================
         case MQTT_EVENT_DATA: {
             char topic[128];  // Буфер для имени топика
-            char data[256];   // Буфер для данных сообщения
+            char data[512];   // Буфер для данных сообщения (увеличен для безопасности)
 
             // Проверяем усечение топика
             if (event->topic_len >= (int)sizeof(topic)) {
-                ESP_LOGW(TAG, "Топик слишком длинный (%d байт) — игнорируем сообщение", event->topic_len);
+                ESP_LOGE(TAG, "Топик слишком длинный (%d байт) — игнорируем сообщение", event->topic_len);
                 break;
             }
 
             // Проверяем усечение payload
             int data_len = event->data_len;
             if (data_len >= (int)sizeof(data)) {
-                ESP_LOGW(TAG, "MQTT payload усечён: %d байт (макс %zu)", data_len, sizeof(data) - 1);
+                ESP_LOGW(TAG, "MQTT payload усечён: %d байт (макс %zu) — обрезано", data_len, sizeof(data) - 1);
                 data_len = sizeof(data) - 1;
             }
 
@@ -606,7 +645,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             snprintf(topic, sizeof(topic), "%.*s", event->topic_len, event->topic);
             snprintf(data, sizeof(data), "%.*s", data_len, event->data);
 
-            ESP_LOGI(TAG, "Получено в %s: %s", topic, data);
+            // Понижено до DEBUG — при частых MQTT-командах INFO засоряет лог.
+            // Для production достаточно логирования в handle_switch_command
+            ESP_LOGD(TAG, "Получено в %s: %s", topic, data);
 
             // -------------------------------------------------------------
             // Обработка команд для устройств (насос, свет, клапан)
@@ -696,11 +737,40 @@ void mqtt_client_init(void)
 {
     ESP_LOGI(TAG, "Инициализация MQTT клиента");
 
-    // Конфигурация MQTT клиента (учётные данные из Kconfig)
+    // Берём настройки из NVS, fallback на Kconfig defaults
+    // Статические буферы — esp_mqtt_client_init копирует строки внутрь конфигурации клиента,
+    // но static защищает от будущих изменений в ESP-IDF (если вдруг перейдут на сохранение указателя)
+    // и подавляет предупреждения статических анализаторов о возврате указателей на стек.
+    // Переиспользование буферов при mqtt_client_restart() безопасно — старый клиент уже уничтожен
+    // к моменту вызова esp_mqtt_client_init() с новыми данными.
+    static char uri[SETTINGS_URI_MAX_LEN];
+    static char user[SETTINGS_SSID_MAX_LEN];
+    static char pass[SETTINGS_PASS_MAX_LEN];
+
+    settings_get_mqtt_uri(uri, sizeof(uri));
+    settings_get_mqtt_user(user, sizeof(user));
+    settings_get_mqtt_pass(pass, sizeof(pass));
+
+    // Fallback на Kconfig если NVS пуст
+    if (uri[0] == '\0') {
+        strncpy(uri, CONFIG_MQTT_BROKER_URI, sizeof(uri) - 1);
+        uri[sizeof(uri) - 1] = '\0';
+    }
+    if (user[0] == '\0') {
+        strncpy(user, CONFIG_MQTT_USERNAME, sizeof(user) - 1);
+        user[sizeof(user) - 1] = '\0';
+    }
+    if (pass[0] == '\0') {
+        strncpy(pass, CONFIG_MQTT_PASSWORD, sizeof(pass) - 1);
+        pass[sizeof(pass) - 1] = '\0';
+    }
+
+    ESP_LOGI(TAG, "MQTT URI: %s", uri);
+
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = CONFIG_MQTT_BROKER_URI,
-        .credentials.username = CONFIG_MQTT_USERNAME,
-        .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
+        .broker.address.uri = uri,
+        .credentials.username = user,
+        .credentials.authentication.password = pass,
     };
 
     // Инициализация клиента
@@ -729,6 +799,39 @@ void mqtt_client_init(void)
     }
 
     ESP_LOGI(TAG, "MQTT клиент запущен, подключение к брокеру...");
+}
+
+/**
+ * @brief Перезапуск MQTT клиента с новыми настройками
+ *
+ * Останавливает текущий клиент, перечитывает настройки из NVS
+ * и создаёт новый клиент.
+ *
+ * @note Вызывается асинхронно — не блокирует вызывающую задачу
+ */
+void mqtt_client_restart(void)
+{
+    if (mqtt_client != NULL) {
+        ESP_LOGI(TAG, "Запрошен перезапуск MQTT клиента...");
+        esp_mqtt_client_stop(mqtt_client);
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = NULL;
+        atomic_store(&mqtt_connected, false);
+    }
+
+    // Сбрасываем флаг discovery — нужно отправить заново
+    atomic_store(&s_discovery_sent, false);
+
+    ESP_LOGI(TAG, "Перезапуск MQTT клиента с новыми настройками");
+    mqtt_client_init();
+}
+
+/**
+ * @brief Установить флаг запроса OTA обновления
+ */
+void mqtt_client_set_ota_flag(void)
+{
+    atomic_store(&ota_update_requested, true);
 }
 
 /**
@@ -775,7 +878,7 @@ void mqtt_client_publish_ota_status(const char *status)
 {
     if (atomic_load(&mqtt_connected) && mqtt_client) {
         int msg_id = esp_mqtt_client_publish(mqtt_client, "hydro/ota/status", status, 0, 1, 0);
-        if (msg_id > 0) {
+        if (msg_id >= 0) {
             ESP_LOGI(TAG, "Опубликован статус OTA: %s (msg_id=%d)", status, msg_id);
         } else {
             ESP_LOGE(TAG, "Ошибка публикации статуса OTA: msg_id=%d", msg_id);
@@ -815,9 +918,7 @@ void mqtt_client_publish_sensor_data(void)
 
     // Формируем единый JSON-пакет со всеми сенсорами
     if (sensor_data.valid) {
-        float tds_ppm = (sensor_data.voltage[2] / TDS_MAX_VOLTAGE_V) * 1000.0f;
-        if (tds_ppm < 0.0f) tds_ppm = 0.0f;
-        if (tds_ppm > 1000.0f) tds_ppm = 1000.0f;
+        float tds_ppm = ads1115_voltage_to_tds(sensor_data.voltage[2]);
 
         offset += snprintf(json_msg + offset, sizeof(json_msg) - offset,
                 "{\"ph\":%.4f,\"tds\":%.0f,\"level\":%.4f,\"water_temp\":%.4f",
@@ -826,6 +927,13 @@ void mqtt_client_publish_sensor_data(void)
     } else {
         offset += snprintf(json_msg + offset, sizeof(json_msg) - offset,
                 "{\"ph\":null,\"tds\":null,\"level\":null,\"water_temp\":null");
+    }
+    // После каждого snprintf проверяем переполнение — если offset >= sizeof(json_msg),
+    // то sizeof(json_msg) - offset подтечёт (unsigned wrap-around) и следующий snprintf
+    // получит огромный size, что приведёт к записи за пределы буфера.
+    if (offset >= sizeof(json_msg)) {
+        ESP_LOGE(TAG, "Переполнение JSON буфера сенсоров (offset=%d)", offset);
+        return;
     }
 
     // DHT данные
@@ -838,10 +946,14 @@ void mqtt_client_publish_sensor_data(void)
         offset += snprintf(json_msg + offset, sizeof(json_msg) - offset,
                 ",\"temp\":null,\"humidity\":null}");
     }
+    if (offset >= sizeof(json_msg)) {
+        ESP_LOGE(TAG, "Переполнение JSON буфера сенсоров (DHT, offset=%d)", offset);
+        return;
+    }
 
     // Одна публикация вместо 6 — экономия ~83% MQTT-трафика
     int msg_id = esp_mqtt_client_publish(mqtt_client, "hydro/sensor/data", json_msg, 0, 0, 0);
-    if (msg_id > 0) {
+    if (msg_id >= 0) {
         ESP_LOGD(TAG, "Опубликованы сенсоры: %s (msg_id=%d)", json_msg, msg_id);
     } else {
         ESP_LOGE(TAG, "Ошибка публикации сенсоров: msg_id=%d", msg_id);
@@ -872,14 +984,16 @@ void mqtt_client_publish_ota_progress(int progress, int downloaded, int total)
         int bytes_written = snprintf(json_msg, sizeof(json_msg),
                 "{\"progress\":%d,\"downloaded\":%d,\"total\":%d}",
                 progress, downloaded, total);
-        
-        if (bytes_written >= sizeof(json_msg)) {
+
+        // bytes_written < 0 — ошибка snprintf (не должно произойти)
+        // (size_t)bytes_written >= sizeof(json_msg) — буфер переполнен, JSON невалидный
+        if (bytes_written < 0 || (size_t)bytes_written >= sizeof(json_msg)) {
             ESP_LOGE(TAG, "Ошибка формирования JSON прогресса OTA: буфер переполнен (%d байт)", bytes_written);
             return;
         }
         
         int msg_id = esp_mqtt_client_publish(mqtt_client, "hydro/ota/progress", json_msg, 0, 1, 0);
-        if (msg_id > 0) {
+        if (msg_id >= 0) {
             ESP_LOGD(TAG, "Опубликован прогресс OTA: %d%% (%d/%d) (msg_id=%d)", progress, downloaded, total, msg_id);
         } else {
             ESP_LOGE(TAG, "Ошибка публикации прогресса OTA: msg_id=%d", msg_id);
@@ -901,7 +1015,7 @@ void mqtt_client_publish_firmware_version(const char *version)
 {
     if (atomic_load(&mqtt_connected) && mqtt_client && version) {
         int msg_id = esp_mqtt_client_publish(mqtt_client, "hydro/firmware/version", version, 0, 1, 1);
-        if (msg_id > 0) {
+        if (msg_id >= 0) {
             ESP_LOGI(TAG, "Опубликована версия прошивки: %s (msg_id=%d)", version, msg_id);
         } else {
             ESP_LOGE(TAG, "Ошибка публикации версии прошивки: msg_id=%d", msg_id);
@@ -945,18 +1059,21 @@ void mqtt_client_publish_mac_address(void)
  * @note Вызывается из espnow_receiver_task при изменении состояния
  * @note Топик: hydro/control/touch, payload: "true"/"false"
  */
-void mqtt_client_publish_touch_state(bool state)
+esp_err_t mqtt_client_publish_touch_state(bool state)
 {
     if (atomic_load(&mqtt_connected) && mqtt_client) {
         const char *payload = state ? "true" : "false";
         int msg_id = esp_mqtt_client_publish(mqtt_client, "hydro/control/touch", payload, 0, 0, 0);
-        if (msg_id > 0) {
+        if (msg_id >= 0) {
             ESP_LOGI(TAG, "Опубликовано состояние touch: %s (msg_id=%d)", payload, msg_id);
+            return ESP_OK;
         } else {
             ESP_LOGE(TAG, "Ошибка публикации touch-состояния: msg_id=%d", msg_id);
+            return ESP_FAIL;
         }
     } else {
         ESP_LOGW(TAG, "Публикация touch-состояния пропущена: connected=%d, client=%p", atomic_load(&mqtt_connected), (void *)mqtt_client);
+        return ESP_ERR_INVALID_STATE;
     }
 }
 

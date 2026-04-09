@@ -7,8 +7,7 @@ dependencies:
     version: '*'
   esp-idf-lib/dht:
     version: '*'
-  protocol_examples_common:
-    path: ${IDF_PATH}/examples/common_components/protocol_examples_common
   espressif/mqtt: ^1.0.0
+  espressif/mdns: ^1.11.0
 description: default
 version: 1.0.0

@@ -1,9 +1,21 @@
 /**
  * @file sntp_client.c
- * @brief Реализация SNTP клиента для синхронизации времени
+ * @brief SNTP клиент для синхронизации времени
  *
- * Компонент использует ESP-IDF SNTP библиотеку для получения
- * точного времени с публичных NTP серверов.
+ * @par Архитектура
+ * - ESP-IDF SNTP работает в фоновом режиме (асинхронно)
+ * - Callback time_sync_notification_cb() вызывается при успешной синхронизации
+ * - Флаг s_time_synced (_Atomic bool) — задачи проверяют перед использованием времени
+ *
+ * @par Часовой пояс
+ * - CONFIG_SNTP_TIMEZONE (Kconfig, по умолч. MSK-5 = UTC+5 Екатеринбург)
+ * - POSIX TZ строка: <offset> = UTC - local, т.е. MSK-5 означает UTC+5
+ * - tzset() применяет пояс после setenv("TZ", ...)
+ *
+ * @par sntp_time_sync() — блокирующая синхронизация
+ * Функция существует для сценариев где нужно дождаться времени ПЕРЕД продолжением.
+ * В основном проекте НЕ используется — SNTP работает асинхронно, задачи проверяют
+ * sntp_client_is_synced() перед чтением времени.
  *
  * @author HydroNFT Team
  * @version 2.0
@@ -53,7 +65,11 @@ void time_sync_notification_cb(struct timeval *tv)
     ESP_LOGI(TAG, "SNTP синхронизировано: %s", strftime_buf);
 
     // Устанавливаем часовой пояс UTC+5 (Екатеринбург)
+#ifdef CONFIG_SNTP_TIMEZONE
+    setenv("TZ", CONFIG_SNTP_TIMEZONE, 1);
+#else
     setenv("TZ", "MSK-5", 1);
+#endif
     tzset();
 
     // Устанавливаем флаг синхронизации
@@ -101,6 +117,13 @@ void sntp_client_init(void)
 
     // Устанавливаем callback для уведомления о синхронизации
     config.sync_cb = time_sync_notification_cb;
+
+    // Плавная синхронизация — корректирует время постепенно (adjtime()),
+    // а не скачком (settimeofday()). Предотвращает:
+    // - Разрыв таймеров слива (esp_timer_get_time не затрагивается, но time() может скакнуть)
+    // - Ложные срабатывания переходов день↔ночь в расписаниях
+    // - Артефакты в логах (время прыгает назад)
+    config.smooth_sync = true;
 
     // Инициализируем SNTP с конфигурацией
     esp_err_t ret = esp_netif_sntp_init(&config);

@@ -78,6 +78,12 @@ void mqtt_ota_progress_task(void *pvParameters);
  */
 void start_ota_progress_task(void);
 
+/**
+ * @brief Задача проверки переподключения WiFi из веб-интерфейса
+ * @param pvParameters Параметры задачи (не используются)
+ */
+void wifi_reconnect_task(void *pvParameters);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,16 @@
+menu "Настройки веб-сервера"
+
+    config WEB_SERVER_ENABLED
+        bool "Включить веб-сервер"
+        default y
+        help
+            Включить встроенный HTTP сервер для локального управления.
+
+    config WEB_SERVER_PORT
+        int "Порт веб-сервера"
+        default 80
+        range 1 65535
+        help
+            TCP порт для HTTP сервера.
+
+endmenu

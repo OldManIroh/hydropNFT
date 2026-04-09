@@ -1,6 +1,29 @@
 /**
  * @file device_control.c
- * @brief Реализация компонента управления оборудованием HydroNFT
+ * @brief Управление оборудованием HydroNFT (GPIO, DHT, режимы)
+ *
+ * @par Функционал
+ * - GPIO: насос (PUMP_PIN), свет (LIGHT_PIN), клапан (VALVE_PIN)
+ * - Хранение данных DHT (температура, влажность) с флагом valid
+ * - Режим AUTO/MANUAL — единый для всех устройств
+ * - Остановка ADS1115 для OTA (атомарный флаг)
+ *
+ * @par EventGroup синхронизация
+ * device_control_set_schedule_event() получает EventGroup из main.c.
+ * device_control_notify_mode_changed() устанавливает биты LIGHT_MODE_BIT и PUMP_MODE_BIT.
+ * Задачи расписаний ждут свои биты через xEventGroupWaitBits(clear_on_exit=TRUE) —
+ * каждый бит очищается только для своей задачи, не мешая другим.
+ *
+ * @par Callback изменения GPIO
+ * device_control_register_state_cb() регистрирует callback из mqtt_client.
+ * Callback вызывается ПОСЛЕ каждого gpio_set_level() в контексте вызывающей задачи
+ * (не ISR!) — безопасно для MQTT публикации.
+ *
+ * @par _Atomic указатель на функцию
+ * s_state_cb — _Atomic device_state_change_cb_t. Формально C11 не гарантирует
+ * атомарность для указателей на функции на всех платформах, но на ESP32 (Xtensa)
+ * указатели 32-битные и атомарны. При портировании на другую архитектуру —
+ * заменить на обычный указатель с мьютексом.
  *
  * @author HydroNFT Team
  * @version 2.0
@@ -41,6 +64,10 @@ static _Atomic device_mode_t s_mode = DEVICE_MODE_MANUAL;
 static _Atomic bool s_ads1115_stop_requested = false;
 
 /// Callback для уведомления об изменении состояния GPIO
+/// Callback уведомления об изменении GPIO (устанавливается из mqtt_client при подключении)
+/// @note _Atomic для указателя на функцию — платформо-зависимая конструкция.
+///   Работает на ESP32 (Xtensa), но может потребовать кастомной реализации
+///   при портировании на другие архитектуры.
 static _Atomic device_state_change_cb_t s_state_cb = NULL;
 
 // ============================================================================
@@ -208,15 +235,20 @@ const char *device_control_mode_to_string(device_mode_t mode)
 
 device_mode_t device_control_mode_from_string(const char *str)
 {
+    if (str == NULL) {
+        ESP_LOGW(TAG, "device_control_mode_from_string: NULL указатель, сохраняю текущий режим");
+        return device_control_get_mode();
+    }
     if (strcmp(str, "manual") == 0) {
         return DEVICE_MODE_MANUAL;
     }
     if (strcmp(str, "auto") == 0) {
         return DEVICE_MODE_AUTO;
     }
-    // Логируем неизвестные значения вместо тихого fallback на AUTO
-    ESP_LOGW(TAG, "Неизвестный режим '%s', использую AUTO", str);
-    return DEVICE_MODE_AUTO;
+    // Логируем неизвестные значения и возвращаем текущий режим — предотвращаем
+    // неожиданное переключение при опечатке или некорректной команде
+    ESP_LOGW(TAG, "Неизвестный режим '%s', сохраняю текущий", str);
+    return device_control_get_mode();
 }
 
 // ============================================================================

@@ -1,3 +1,33 @@
+menu "Настройки оборудования"
+
+    config PUMP_GPIO
+        int "GPIO пин насоса"
+        default 19
+        help
+            Номер GPIO пина для управления насосом.
+
+    config LIGHT_GPIO
+        int "GPIO пин света"
+        default 18
+        help
+            Номер GPIO пина для управления светом (фитолампа).
+
+    config VALVE_GPIO
+        int "GPIO пин клапана"
+        default 4
+        help
+            Номер GPIO пина для управления клапаном.
+
+    config VALVE_DRAIN_DURATION_MIN
+        int "Время слива воды (минуты)"
+        default 5
+        range 1 30
+        help
+            Длительность слива воды через клапан в минутах.
+            Используется в автоматическом режиме DRAINING.
+
+endmenu
+
 menu "Настройки датчика DHT"
 
     choice EXAMPLE_CHIP_TYPE
@@ -29,5 +59,17 @@ menu "Настройки датчика DHT"
             Включите, если на пине данных нет внешнего pull-up резистора.
             Датчики DHT на печатной плате обычно имеют встроенный pull-up.
             Для стабильной работы рекомендуется внешний резистор 10 кОм.
+
+endmenu
+
+menu "Настройки точки доступа (AP)"
+
+    config AP_WIFI_PASSWORD
+        string "Пароль точки доступа"
+        default "hydronft12345678"
+        help
+            Пароль WPA2 для точки доступа HydroNFT_XXYY.
+            Минимум 8 символов. Используется для защиты
+            веб-интерфейса при подключении напрямую к устройству.
 
 endmenu

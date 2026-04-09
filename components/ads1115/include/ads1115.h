@@ -1,11 +1,16 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
+#include <stdatomic.h>
 #include <esp_err.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/// Атомарный флаг: задача ADS1115 активна (устанавливается в init, сбрасывается при остановке для OTA)
+extern _Atomic bool g_ads1115_task_active;
 
 /**
  * @brief Инициализация компонента ADS1115
@@ -79,6 +84,29 @@ typedef struct {
  * @return Копия структуры с данными
  */
 ads1115_sensor_data_t ads1115_get_latest_data(void);
+
+// ============================================================================
+// КОНСТАНТЫ И INLINE-ФУНКЦИИ ПРЕОБРАЗОВАНИЯ СЕНСОРОВ
+// ============================================================================
+
+/// Максимальное напряжение TDS датчика при 1000 ppm
+#define ADS1115_TDS_MAX_VOLTAGE_V 2.3f
+
+/// Количество каналов ADS1115
+#define ADS1115_NUM_CHANNELS 4
+
+/**
+ * @brief Преобразовать напряжение TDS (канал 2) в ppm
+ * @param voltage Напряжение с канала 2 ADS1115
+ * @return TDS в ppm, клamped 0–1000
+ */
+static inline float ads1115_voltage_to_tds(float voltage)
+{
+    float tds = (voltage / ADS1115_TDS_MAX_VOLTAGE_V) * 1000.0f;
+    if (tds < 0.0f) tds = 0.0f;
+    if (tds > 1000.0f) tds = 1000.0f;
+    return tds;
+}
 
 #ifdef __cplusplus
 }

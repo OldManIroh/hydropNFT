@@ -1,18 +1,28 @@
 /**
  * @file espnow_receiver.c
- * @brief ESP-NOW приёмник для HydroNFT
+ * @brief ESP-NOW приёмник сигналов уровня воды
  *
- * Принимает бинарные пакеты состояния от espnow_binary_state устройства
- * и публикует изменения в MQTT топик hydro/control/touch.
+ * @par Архитектура
+ * Принимает бинарные пакеты от внешнего ESP32-передатчика (уровень воды в баке):
+ * - uint8_t  state     (1 = верхний уровень, 0 = нижний)
+ * - uint16_t seq_num   (порядковый номер для отладки)
+ * - uint16_t crc       (CRC16 для защиты от помех)
  *
- * Формат пакета (отправитель espnow_binary_state):
- * - uint8_t  state     (1 = касание, 0 = нет касания)
- * - uint16_t seq_num   (порядковый номер)
- * - uint16_t crc       (CRC16 контроль суммы)
+ * @par Поток данных
+ * 1. ESP-NOW callback (WiFi task context) → валидация CRC → атомарная запись
+ * 2. espnow_receiver_task (FreeRTOS задача) → чтение состояния → MQTT публикация
  *
- * Архитектура:
- * - ESP-NOW callback сохраняет состояние в _Atomic bool (минимум работы в IRQ)
- * - FreeRTOS задача читает состояние и публикует в MQTT при изменении
+ * @par Безопасность
+ * - CRC16 проверяется в callback — пакеты с ошибками отбрасываются до записи
+ * - MAC-адрес хранится в _Atomic uint64_t (48-bit MAC + 16-bit padding) —
+ *   атомарный доступ на ESP32, torn read невозможен
+ * - Приёмник НЕ меняет канал WiFi — работает на канале роутера (STA/APSTA режим)
+ *   Передатчик должен быть на том же канале.
+ *
+ * @par ESP-NOW инициализация
+ * - PMK ключ должен совпадать с передатчиком (CONFIG_ESPNOW_PMK)
+ * - Wi-Fi должен быть в STA или APSTA режиме (проверяется при init)
+ * - Канал НЕ меняется — esp_wifi_set_channel() не вызывается
  *
  * @author HydroNFT Team
  * @version 1.0
@@ -55,8 +65,8 @@ static _Atomic bool s_state_changed = false;
 static _Atomic bool s_pending_publish = false;
 
 /// MAC-адрес последнего отправителя (для отладки)
-/// @note Используется только для логирования — stale значения допустимы
-static uint8_t s_last_sender_mac[6] = {0};
+/// @note Атомарный доступ через 64-bit packed (48-bit MAC + padding)
+static _Atomic uint64_t s_last_sender_mac = 0;
 
 /// Счётчик принятых пакетов
 static _Atomic uint32_t s_packet_count = 0;
@@ -98,11 +108,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         return;
     }
 
-    // Сохраняем MAC-адрес отправителя (только для отладки)
-    // ПРИМЕЧАНИЕ: memcpy 6 байт не атомарен — возможен torn read при одновременном
-    // чтении из espnow_receiver_task(). Для отладочных целей это допустимо.
+    // Сохраняем MAC-адрес отправителя атомарно (64-bit write = атомарно на ESP32)
     if (recv_info->src_addr != NULL) {
-        memcpy(s_last_sender_mac, recv_info->src_addr, 6);
+        uint64_t mac64 = 0;
+        memcpy(&mac64, recv_info->src_addr, 6);  // 6 байт MAC → uint64_t
+        atomic_store(&s_last_sender_mac, mac64);
     }
 
     // Извлекаем состояние (0=false, ненулевое=true)
@@ -140,25 +150,18 @@ esp_err_t espnow_receiver_init(void)
         }
     }
 
-    // Проверяем текущий канал Wi-Fi
-    uint8_t current_primary;
-    wifi_second_chan_t current_second;
-    ret = esp_wifi_get_channel(&current_primary, &current_second);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Текущий Wi-Fi канал: %d", current_primary);
-    }
-
-    // Устанавливаем канал только если он отличается от нужного
-    if (ret != ESP_OK || current_primary != CONFIG_ESPNOW_CHANNEL) {
-        ret = esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Не удалось установить канал %d: %d, продолжаем на текущем",
-                     CONFIG_ESPNOW_CHANNEL, ret);
-        } else {
-            ESP_LOGI(TAG, "Wi-Fi канал установлен: %d", CONFIG_ESPNOW_CHANNEL);
+    // Приёмник ESP-NOW остаётся на канале роутера — НЕ меняем канал.
+    // STA уже подключён к AP и работает на его канале.
+    // ESP-NOW использует тот же радиомодуль, поэтому автоматически
+    // слушает на канале роутера. Передатчик должен быть настроен
+    // на тот же канал (фиксированный канал роутера).
+    {
+        uint8_t current_primary;
+        wifi_second_chan_t current_second;
+        ret = esp_wifi_get_channel(&current_primary, &current_second);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "ESP-NOW слушает на канале Wi-Fi: %d (канал роутера)", current_primary);
         }
-    } else {
-        ESP_LOGI(TAG, "Канал %d уже установлен, менять не нужно", current_primary);
     }
 
     // Инициализация ESP-NOW (должна быть ДО esp_now_set_pmk)
@@ -205,9 +208,10 @@ void espnow_receiver_task(void *pvParameters)
 
             // Публикуем только если состояние реально изменилось
             if (current_state != last_published_state) {
-                // Копируем MAC-адрес (только для логирования — допустимо получить stale значение)
+                // Читаем MAC-адрес атомарно (64-bit read = атомарно на ESP32)
+                uint64_t mac64 = atomic_load(&s_last_sender_mac);
                 uint8_t local_mac[6];
-                memcpy(local_mac, s_last_sender_mac, 6);
+                memcpy(local_mac, &mac64, 6);
 
                 // Формируем строку MAC-адреса для логирования
                 char mac_str[18];
@@ -220,29 +224,30 @@ void espnow_receiver_task(void *pvParameters)
                          atomic_load(&s_packet_count), atomic_load(&s_crc_errors));
 
                 // Публикуем в MQTT если подключены
-                if (mqtt_client_is_connected()) {
-                    mqtt_client_publish_touch_state(current_state);
-                    atomic_store(&s_pending_publish, false);  // Успешно — сбрасываем pending
+                esp_err_t pub_res = mqtt_client_publish_touch_state(current_state);
+                if (pub_res == ESP_OK) {
+                    atomic_store(&s_pending_publish, false);
                     last_published_state = current_state;
                 } else {
-                    // Не восстанавливаем s_state_changed — это вызывало лавину логов.
-                    // Вместо этого ставим флаг pending и публикуем при восстановлении MQTT.
+                    // Ошибка публикации — установим pending для повторной попытки
                     if (!atomic_load(&s_pending_publish)) {
                         atomic_store(&s_pending_publish, true);
-                        ESP_LOGW(TAG, "MQTT не подключён, touch=%s ожидает публикации",
-                                 current_state ? "true" : "false");
                     }
                 }
             }
+            // Состояние не изменилось — ничего публиковать не нужно
         }
 
         // Публикуем отложенное состояние как только MQTT восстановится
         if (atomic_load(&s_pending_publish) && mqtt_client_is_connected()) {
             bool pending_state = atomic_load(&s_touch_state);
-            mqtt_client_publish_touch_state(pending_state);
-            atomic_store(&s_pending_publish, false);
-            ESP_LOGI(TAG, "ESP-NOW: отложенная публикация touch=%s выполнена",
-                     pending_state ? "true" : "false");
+            esp_err_t pub_res = mqtt_client_publish_touch_state(pending_state);
+            if (pub_res == ESP_OK) {
+                atomic_store(&s_pending_publish, false);
+                last_published_state = pending_state;
+                ESP_LOGI(TAG, "ESP-NOW: отложенная публикация touch=%s выполнена",
+                         pending_state ? "true" : "false");
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));

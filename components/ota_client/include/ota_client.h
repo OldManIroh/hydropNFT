@@ -61,6 +61,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <esp_err.h>
 #include <freertos/task.h>
 
 #ifdef __cplusplus
@@ -128,9 +129,9 @@ void ota_init(void);
 
 /**
  * @brief Запуск задачи OTA-обновления
- * 
+ *
  * Создаёт новую задачу FreeRTOS для выполнения OTA обновления.
- * 
+ *
  * Процесс обновления в задаче:
  * 1. Подключение к HTTPS серверу (из CONFIG_EXAMPLE_FIRMWARE_UPG_URL)
  * 2. Загрузка бинарника прошивки порциями по 1024 байта
@@ -141,21 +142,35 @@ void ota_init(void);
  * 7. Валидация контрольной суммы образа
  * 8. Установка нового раздела как загрузочного
  * 9. Перезагрузка устройства
- * 
+ *
+ * @return ESP_OK при успешном создании задачи OTA
+ * @return ESP_ERR_NO_MEM если не удалось создать задачу
+ * @return ESP_ERR_INVALID_STATE если OTA уже выполняется
+ *
  * @note Функция не блокирующая - возвращается сразу после создания задачи
  * @note Задача имеет приоритет 5 (выше среднего)
  * @note Размер стека задачи: 8192 байт
  * @note После успешной загрузки устройство ПЕРЕЗАГРУЗИТСЯ
- * 
+ *
  * @note Конфигурация (через menuconfig):
  * - CONFIG_EXAMPLE_FIRMWARE_UPG_URL - URL прошивки
  * - CONFIG_EXAMPLE_OTA_RECV_TIMEOUT - таймаут получения (мс)
  * - CONFIG_EXAMPLE_GPIO_DIAGNOSTIC - GPIO для диагностики
  * - CONFIG_EXAMPLE_CONNECT_WIFI - использовать Wi-Fi
- * 
+ *
  * @see ota_init()
  */
-void ota_start_task(void);
+esp_err_t ota_start_task(void);
+
+/**
+ * @brief Запуск задачи публикации прогресса OTA в MQTT
+ *
+ * Создаёт динамическую задачу, которая публикует прогресс OTA
+ * в MQTT. Задача завершает себя после окончания OTA сессии.
+ *
+ * @note Вызывается после ota_start_task()
+ */
+void start_ota_progress_task(void);
 
 /**
  * @brief Функция диагностики работоспособности после обновления

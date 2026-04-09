@@ -47,9 +47,9 @@ extern "C" {
  * и инициирует подключение к брокеру.
  * 
  * Конфигурация брокера (настраивается в mqtt_client.c):
- * - URI: mqtt://192.168.0.105:1883
- * - Username: hydroesp32
- * - Password: asda
+ * - URI: mqtt://<broker_address>:1883
+ * - Username: <your_username>
+ * - Password: <your_password>
  * 
  * После успешного подключения:
  * 1. Отправляются конфигурации для Home Assistant Discovery
@@ -210,7 +210,25 @@ void mqtt_client_publish_mac_address(void);
  * @note Формат: "true" или "false"
  * @note QoS=0, retain=0
  */
-void mqtt_client_publish_touch_state(bool state);
+esp_err_t mqtt_client_publish_touch_state(bool state);
+
+/**
+ * @brief Перезапуск MQTT клиента с новыми настройками
+ *
+ * Останавливает текущий MQTT клиент, перечитывает настройки из NVS
+ * и создаёт новый клиент с обновлёнными параметрами.
+ *
+ * @note Вызывается из веб-сервера после сохранения настроек MQTT
+ */
+void mqtt_client_restart(void);
+
+/**
+ * @brief Установить флаг запроса OTA обновления
+ *
+ * Вызывается из веб-интерфейса для предотвращения гонки
+ * между OTA из MQTT и OTA из веб-сервера.
+ */
+void mqtt_client_set_ota_flag(void);
 
 #ifdef __cplusplus
 }

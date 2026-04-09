@@ -1,18 +1,34 @@
 /**
  * @file log_forwarder.c
- * @brief Компонент пересылки WARNING и ERROR логов в MQTT
+ * @brief Пересылка WARNING/ERROR логов ESP-IDF в MQTT
  *
- * Перехватывает логи ESP-IDF через esp_log_set_vprintf()
- * и отправляет только WARNING и ERROR уровни в Home Assistant.
+ * @par Архитектура
+ * 1. esp_log_set_vprintf(log_vprintf) — перехват ВСЕХ логов ESP-IDF
+ * 2. log_vprintf() → парсинг уровня (E/W/I/D/V) из строки
+ * 3. Только WARNING (W) и ERROR (E) → буфер → MQTT публикация
+ * 4. INFO/DEBUG → только UART (не засоряют MQTT)
  *
- * ВАЖНО: esp_log_set_vprintf() получает строку, которая уже содержит
- * ANSI escape-коды цветов (если они включены в menuconfig).
- * Формат с цветами:  "\033[0;33mW (12345) tag: message\033[0m\n"
- * Формат без цветов: "W (12345) tag: message\n"
+ * @par Защита от рекурсии
+ * s_inside_log_handler — атомарный флаг. Если log_vprintf вызван рекурсивно
+ * (например, ESP_LOGE внутри нашего кода), флаг уже установлен → vprintf
+ * напрямую в UART, без MQTT. Без этого — бесконечная рекурсия → stack overflow.
  *
- * Для корректной работы рекомендуется отключить цвета в menuconfig:
- *   Component config → Log output → Use ANSI terminal colors → OFF
- * Или использовать парсинг с учётом escape-кодов (реализовано ниже).
+ * @par Throttling
+ * s_last_log_time обновляется ТОЛЬКО после успешной MQTT публикации.
+ * Если MQTT отключён, логи НЕ теряются — throttle не срабатывает и при
+ * восстановлении соединения логи будут отправлены.
+ * Интервал: 200 мс (макс 5 логов/сек в MQTT).
+ *
+ * @par ANSI escape-коды
+ * Если цвета включены в menuconfig, лог приходит как:
+ *   "\033[0;33mW (12345) tag: message\033[0m\n"
+ * extract_log_level() парсит уровень после escape-последовательности.
+ * strip_ansi_codes() удаляет escape-коды перед публикацией в MQTT.
+ *
+ * @par Производительность
+ * Каждый лог форматируется дважды: vprintf() для UART + vsnprintf() для анализа.
+ * Для INFO/DEBUG логов (которые не отправляются в MQTT) vsnprintf — лишняя работа.
+ * Оптимизация: форматировать один раз в буфер, затем fputs() в UART.
  *
  * @author HydroNFT Team
  * @version 2.0
@@ -180,7 +196,7 @@ static int log_vprintf(const char *fmt, va_list args)
 
     // Форматируем строку во временный буфер для анализа уровня
     // Используем args_copy (т.к. args уже использован в vprintf)
-    char temp_buf[256];
+    char temp_buf[512];
     vsnprintf(temp_buf, sizeof(temp_buf), fmt, args_copy);
     va_end(args_copy);
 
@@ -200,7 +216,6 @@ static int log_vprintf(const char *fmt, va_list args)
         atomic_store(&s_inside_log_handler, false);
         return ret;
     }
-    atomic_store(&s_last_log_time, now);
 
     // Проверяем подключение к MQTT
     if (!mqtt_client_is_connected()) {
@@ -210,6 +225,7 @@ static int log_vprintf(const char *fmt, va_list args)
 
     // Формируем сообщение для MQTT (защищаем мьютексом)
     // Используем xSemaphoreTake с таймаутом 0 — не блокируемся
+    bool published = false;
     if (xSemaphoreTake(s_buffer_mutex, 0) == pdTRUE) {
         // Очищаем ANSI escape-коды для чистого текста в MQTT
         strip_ansi_codes(s_log_buffer, sizeof(s_log_buffer), temp_buf);
@@ -218,9 +234,15 @@ static int log_vprintf(const char *fmt, va_list args)
         esp_mqtt_client_handle_t client = (esp_mqtt_client_handle_t)mqtt_client_get_handle();
         if (client != NULL) {
             esp_mqtt_client_publish(client, LOG_MQTT_TOPIC, s_log_buffer, 0, 1, 0);
+            published = true;
         }
 
         xSemaphoreGive(s_buffer_mutex);
+    }
+
+    // Обновляем throttle время только после успешной публикации — избегаем потери логов
+    if (published) {
+        atomic_store(&s_last_log_time, now);
     }
 
     // Снимаем флаг рекурсии

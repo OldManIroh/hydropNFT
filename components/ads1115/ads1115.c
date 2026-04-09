@@ -2,17 +2,30 @@
  * @file ads1115.c
  * @brief Драйвер ADS1115 для HydroNFT
  *
- * Компонент для работы с 4-канальным 16-битным АЦП ADS1115 через I2C.
+ * @par Компонент для работы с 4-канальным 16-битным АЦП ADS1115 через I2C
  * Используется для чтения аналоговых датчиков:
- * - Канал 0: pH метр
- * - Канал 1: Температура воды
- * - Канал 2: TDS метр
- * - Канал 3: Уровень воды
+ * - Канал 0: pH метр (напряжение)
+ * - Канал 1: Температура воды (напряжение)
+ * - Канал 2: TDS метр (напряжение)
+ * - Канал 3: Уровень воды (напряжение)
  *
- * Особенности реализации:
- * - Мьютекс для защиты от одновременного доступа
- * - Медианный фильтр (окно 5 отсчётов) для подавления шумов
- * - Обработка таймаутов I2C
+ * @par Медианный фильтр
+ * - Окно 5 отсчётов на канал — подавляет импульсные шумы I2C
+ * - Первые 5 измерений возвращают «сырое» значение (буфер не заполнен)
+ * - Это предотвращает публикацию артефактов инициализации как реальных данных
+ *
+ * @par Потокобезопасность
+ * - ads1115_mutex — защищает I2C шину. Один захват на все 4 канала (batch),
+ *   чтобы другие компоненты (если будут) не вклинивались между измерениями.
+ *   Без batch: 4 отдельных захвата = 4x overhead + риск рассинхронизации данных.
+ * - s_data_mutex — защищает latest_sensor_data от race condition с MQTT задачей
+ * - g_ads1115_task_active — атомарный флаг для безопасной деинициализации
+ *
+ * @par Деинициализация
+ * ads1115_deinit() ждёт 2 сек пока задача ADS1115 завершится, затем
+ * дополнительные 100 мс для гарантированного завершения vTaskDelete().
+ * Без этого vSemaphoreDelete() может удалить мьютекс пока задача ещё
+ * держит его (xSemaphoreGive в конце ads1115_measure_all_channels).
  *
  * @author HydroNFT Team
  * @version 2.0
@@ -50,6 +63,9 @@ static bool ads1115_initialized = false;
 /// Флаг: этот компонент вызывал i2cdev_init() — для корректной деинициализации
 static bool s_i2cdev_owned = false;
 
+/// Атомарный флаг: задача ADS1115 активна (устанавливается в init, сбрасывается при остановке для OTA)
+_Atomic bool g_ads1115_task_active = false;
+
 /// Мьютекс для защиты доступа к I2C шине
 static SemaphoreHandle_t ads1115_mutex = NULL;
 
@@ -63,7 +79,7 @@ static SemaphoreHandle_t s_data_mutex = NULL;
 typedef struct {
     float voltage_buffer[4][ADS1115_FILTER_WINDOW_SIZE];
     uint8_t buffer_index;
-    bool buffer_filled;
+    uint8_t samples_count[4];  ///< Счётчик сэмплов для каждого канала
 } ads1115_filter_state_t;
 
 static ads1115_filter_state_t filter_state = {0};
@@ -78,7 +94,7 @@ static ads1115_sensor_data_t latest_sensor_data = {0};
 #define ADS1115_I2C_TIMEOUT_MS 200
 
 /// Настройки мультиплексора для каналов 0-3 (каждый канал к GND)
-static const ads111x_mux_t mux_settings[4] = {
+static const ads111x_mux_t mux_settings[ADS1115_NUM_CHANNELS] = {
     ADS111X_MUX_0_GND,  ///< Канал 0: AIN0 к GND
     ADS111X_MUX_1_GND,  ///< Канал 1: AIN1 к GND
     ADS111X_MUX_2_GND,  ///< Канал 2: AIN2 к GND
@@ -199,6 +215,7 @@ esp_err_t ads1115_init(void)
     }
 
     ads1115_initialized = true;
+    atomic_store(&g_ads1115_task_active, true);
     ESP_LOGI(TAG, "ADS1115 успешно инициализирован");
     return ESP_OK;
 }
@@ -352,26 +369,24 @@ esp_err_t ads1115_measure_all_channels(ads1115_measurement_t *measurements)
             continue;
         }
 
-        // Инициализация буфера при первом измерении
-        if (!filter_state.buffer_filled) {
-            for (int i = 0; i < ADS1115_FILTER_WINDOW_SIZE; i++) {
-                filter_state.voltage_buffer[ch][i] = voltage;
-            }
-        }
-
         // Добавляем в буфер фильтра
         filter_state.voltage_buffer[ch][filter_state.buffer_index] = voltage;
+        filter_state.samples_count[ch]++;
 
-        // Применяем медианный фильтр (всегда, т.к. буфер инициализирован)
+        // Пропускаем первые ADS1115_FILTER_WINDOW_SIZE измерений — буфер ещё не заполнен
+        if (filter_state.samples_count[ch] < ADS1115_FILTER_WINDOW_SIZE) {
+            measurements[ch].voltage = voltage;  // Возвращаем «сырое» значение
+            measurements[ch].error = ESP_OK;
+            continue;
+        }
+
+        // Применяем медианный фильтр (буфер полностью заполнен)
         measurements[ch].voltage = median_filter_float(
             filter_state.voltage_buffer[ch], ADS1115_FILTER_WINDOW_SIZE);
     }
 
     // Циклический буфер: индекс 0→1→2→3→4→0...
     filter_state.buffer_index = (filter_state.buffer_index + 1) % ADS1115_FILTER_WINDOW_SIZE;
-    if (filter_state.buffer_index == 0) {
-        filter_state.buffer_filled = true;  // Буфер заполнен хотя бы один раз
-    }
 
     // Обновляем последние данные для доступа из MQTT (под мьютексом)
     if (xSemaphoreTake(s_data_mutex, portMAX_DELAY) == pdTRUE) {
@@ -435,6 +450,26 @@ void ads1115_deinit(void)
 {
     ESP_LOGI(TAG, "Деинициализация ADS1115 для OTA...");
 
+    // Сигналим задаче остановиться (флаг уже установлен через device_control_ads1115_stop_for_ota)
+    // Ждём пока задача ADS1115 сбросит флаг активности (максимум 2 сек)
+    // Это предотвращает use-after-free мьютекса: задача может держать ads1115_mutex
+    // в момент вызова ads1115_deinit(). Ожидание гарантирует что задача завершилась
+    // до удаления мьютекса через vSemaphoreDelete().
+    int wait_ms = 0;
+    while (atomic_load(&g_ads1115_task_active) && wait_ms < 2000) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        wait_ms += 50;
+    }
+    if (atomic_load(&g_ads1115_task_active)) {
+        ESP_LOGW(TAG, "Задача ADS1115 не освободила мьютекс за 2 сек — принудительная деинициализация");
+    } else {
+        // Задача сбросила флаг и вызывает vTaskDelete(), но планировщик ещё не удалил её.
+        // Ждём 100мс — достаточно для гарантированного завершения задачи на ESP32.
+        // Без этой задержки возможен race: vSemaphoreDelete() вызван пока задача
+        // ещё в процессе очистки (xSemaphoreGive в конце ads1115_measure_all_channels).
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     // Освобождаем мьютексы
     if (ads1115_mutex != NULL) {
         vSemaphoreDelete(ads1115_mutex);
@@ -486,6 +521,20 @@ void ads1115_reset(void)
 {
     ESP_LOGI(TAG, "Сброс состояния ADS1115...");
 
+    // Ждём пока задача ADS1115 завершится — предотвращаем use-after-free мьютекса.
+    // В отличие от ads1115_deinit() этот вызов может произойти когда задача ещё работает.
+    int wait_ms = 0;
+    while (atomic_load(&g_ads1115_task_active) && wait_ms < 2000) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        wait_ms += 50;
+    }
+    if (atomic_load(&g_ads1115_task_active)) {
+        ESP_LOGW(TAG, "Задача ADS1115 не завершилась за 2 сек — принудительный сброс");
+    } else {
+        // Задача завершилась, ждём гарантированного завершения планировщика
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     // Освобождаем мьютексы если существуют
     if (ads1115_mutex != NULL) {
         vSemaphoreDelete(ads1115_mutex);
@@ -500,7 +549,7 @@ void ads1115_reset(void)
     memset(&device, 0, sizeof(device));
     gain_val = 0.0f;
 
-    // Сбрасываем состояние фильтра
+    // Сбрасываем состояние фильтра (мьютекс уже удалён, задача остановлена — безопасно)
     memset(&filter_state, 0, sizeof(filter_state));
 
     ESP_LOGI(TAG, "Состояние ADS1115 сброшено");
