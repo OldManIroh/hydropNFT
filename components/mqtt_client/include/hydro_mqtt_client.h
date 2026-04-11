@@ -85,6 +85,22 @@ void mqtt_client_init(void);
 bool mqtt_client_is_connected(void);
 
 /**
+ * @brief Включить/отключить MQTT клиент
+ * @param enabled true — включить, false — отключить
+ *
+ * @note При отключении клиент не разрывает текущее соединение,
+ *       но предотвращает автоматическое переподключение
+ * @note При повторном включении вызывается mqtt_client_restart()
+ */
+void mqtt_client_set_enabled(bool enabled);
+
+/**
+ * @brief Проверить, включён ли MQTT клиент
+ * @return true если MQTT включён (по умолчанию true)
+ */
+bool mqtt_client_is_enabled(void);
+
+/**
  * @brief Сброс флага OTA обновления
  *
  * Сбрасывает флаг ota_update_requested в false.

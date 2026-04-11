@@ -152,7 +152,7 @@ static const char *MAIN_PAGE =
     "<div class='refresh'>Автообновление каждые 5 секунд</div>"
 
     "<script>"
-    "async function api(url){try{const r=await fetch(url);return await r.json()}"
+    "async function api(url){try{const r=await fetch(url+'?_='+Date.now(),{cache:'no-store'});return await r.json()}"
     "  catch(e){console.error(e);return null}}"
     "async function update(){"
     "  const s=await api('/api/sensors');if(!s)return;"
@@ -163,7 +163,7 @@ static const char *MAIN_PAGE =
     "  document.getElementById('temp').textContent=s.temp!==null?s.temp.toFixed(1)+' °C':'—';"
     "  document.getElementById('humidity').textContent=s.humidity!==null?s.humidity.toFixed(1)+'%':'—';"
     "  const c=await api('/api/control');if(!c)return;"
-    "  setStatus('pump',c.pump==='ON');setStatus('light',c.light==='ON');setStatus('valve',c.valve==='ON');"
+    "  setStatus('pump_status',c.pump==='ON');setStatus('light_status',c.light==='ON');setStatus('valve_status',c.valve==='ON');"
     "  document.getElementById('pumpToggle').checked=(c.pump==='ON');"
     "  document.getElementById('lightToggle').checked=(c.light==='ON');"
     "  document.getElementById('valveToggle').checked=(c.valve==='ON');"
@@ -305,7 +305,6 @@ static const char *SETTINGS_PAGE =
     "async function restartDevice(){"
     "  if(confirm('Перезагрузить устройство?')){"
     "    await fetch('/settings/restart',{method:'POST'});showMsg('Устройство перезагружается...',true)}}"
-    "}"
     "loadStatus();setInterval(loadStatus,10000);"
     "</script></body></html>";
 
@@ -316,6 +315,7 @@ static const char *SETTINGS_PAGE =
 static esp_err_t main_page_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_send(req, MAIN_PAGE, strlen(MAIN_PAGE));
     return ESP_OK;
 }
@@ -327,6 +327,7 @@ static esp_err_t main_page_handler(httpd_req_t *req)
 static esp_err_t settings_page_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_send(req, SETTINGS_PAGE, strlen(SETTINGS_PAGE));
     return ESP_OK;
 }
@@ -378,6 +379,7 @@ static esp_err_t api_sensors_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_send(req, json, strlen(json));
     return ESP_OK;
 }
@@ -400,6 +402,7 @@ static esp_err_t api_control_handler(httpd_req_t *req)
              device_control_mode_to_string(device_control_get_mode()));
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_send(req, json, strlen(json));
     return ESP_OK;
 }
@@ -587,6 +590,7 @@ static esp_err_t api_set_handler(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid state: use ON/OFF");
             return ESP_FAIL;
         }
+        device_control_set_mode(DEVICE_MODE_MANUAL);
         device_control_set_pump_state(state_on);
     }
     else if (strcmp(device, "light") == 0)
@@ -595,6 +599,7 @@ static esp_err_t api_set_handler(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid state: use ON/OFF");
             return ESP_FAIL;
         }
+        device_control_set_mode(DEVICE_MODE_MANUAL);
         device_control_set_light_state(state_on);
     }
     else if (strcmp(device, "valve") == 0)
@@ -603,6 +608,7 @@ static esp_err_t api_set_handler(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid state: use OPEN/CLOSE or ON/OFF");
             return ESP_FAIL;
         }
+        device_control_set_mode(DEVICE_MODE_MANUAL);
         device_control_set_valve_state(state_on);
     }
     else if (strcmp(device, "mode") == 0)
@@ -744,6 +750,7 @@ static esp_err_t api_status_handler(httpd_req_t *req)
              fw_version, mac_str, ota_status);
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_send(req, json, strlen(json));
     return ESP_OK;
 }

@@ -62,6 +62,7 @@ static esp_mqtt_client_handle_t mqtt_client;
 
 /// Флаг состояния подключения к MQTT брокеру
 static _Atomic bool mqtt_connected = false;
+static _Atomic bool s_mqtt_enabled = true;  // MQTT включён по умолчанию
 
 /// Флаг запроса OTA обновления - устанавливается при получении команды из MQTT
 /// Используется в main.c для запуска процесса обновления прошивки
@@ -193,42 +194,36 @@ static void send_discovery_switch(esp_mqtt_client_handle_t client, const char *o
 }
 
 /**
- * @brief Отправка конфигурации селектора режима для Home Assistant Discovery
+ * @brief Отправка конфигурации выключателя с настраиваемыми payload для HA Discovery
  *
- * Селекторы (select) используются для переключения режимов AUTO/MANUAL.
- *
- * @param client Дескриптор MQTT клиента
- * @param object_id Уникальный идентификатор (например: "pump_mode")
- * @param name Отображаемое имя в HA
- * @param command_topic Топик для получения команд
- * @param state_topic Топик для отправки состояния
- *
- * @note Опции: "auto", "manual"
+ * @param payload_on Значение для включения (например "auto")
+ * @param payload_off Значение для выключения (например "manual")
  */
-static void send_discovery_select(esp_mqtt_client_handle_t client, const char *object_id,
-                                  const char *name, const char *command_topic, const char *state_topic)
+static void send_discovery_switch_custom(esp_mqtt_client_handle_t client, const char *object_id,
+                                  const char *name, const char *command_topic, const char *state_topic,
+                                  const char *payload_on, const char *payload_off)
 {
     char topic[128];
     char payload[512];
 
-    snprintf(topic, sizeof(topic), "homeassistant/select/hydroesp32/%s/config", object_id);
+    snprintf(topic, sizeof(topic), "homeassistant/switch/hydroesp32/%s/config", object_id);
 
     int ret = snprintf(payload, sizeof(payload),
              "{\"name\":\"%s\","
              "\"command_topic\":\"%s\","
              "\"state_topic\":\"%s\","
-             "\"options\":[\"auto\",\"manual\"],"
+             "\"payload_on\":\"%s\","
+             "\"payload_off\":\"%s\","
              "\"unique_id\":\"esp32_hydro_%s\","
-             "\"icon\":\"mdi:cog\","
              "%s}",
-             name, command_topic, state_topic, object_id, HA_DEVICE_BLOCK);
+             name, command_topic, state_topic, payload_on, payload_off, object_id, HA_DEVICE_BLOCK);
     if (ret < 0 || (size_t)ret >= sizeof(payload)) {
-        ESP_LOGW(TAG, "Обрезан discovery payload для select %s — пропускаю", object_id);
+        ESP_LOGW(TAG, "Обрезан discovery payload для switch %s — пропускаю", object_id);
         return;
     }
 
     int msg_id = esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
-    ESP_LOGI(TAG, "Отправлена конфигурация селектора %s, msg_id=%d", object_id, msg_id);
+    ESP_LOGI(TAG, "Отправлена конфигурация переключателя %s (ON=%s, OFF=%s), msg_id=%d", object_id, payload_on, payload_off, msg_id);
 }
 
 /**
@@ -409,6 +404,18 @@ static void on_device_state_changed(const char *topic, bool state)
     }
 }
 
+/**
+ * @brief Callback для публикации изменения режима в MQTT
+ * Вызывается из device_control при изменении режима (AUTO/MANUAL).
+ */
+static void on_mode_changed(const char *mode_str)
+{
+    if (atomic_load(&mqtt_connected) && mqtt_client) {
+        esp_mqtt_client_publish(mqtt_client, "hydro/switch/mode/state", mode_str, 0, 1, 0);
+        ESP_LOGD(TAG, "Опубликован режим: %s", mode_str);
+    }
+}
+
 // ============================================================================
 // HELPER ДЛЯ ОБРАБОТКИ MQTT КОМАНД УСТРОЙСТВ
 // ============================================================================
@@ -514,9 +521,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 send_discovery_switch(mqtt_client, "valve", "Клапан воды",
                                       "hydro/switch/valve/set", "hydro/switch/valve/state");
 
-                // === Селектор режима (AUTO/MANUAL) — общий для всех устройств ===
-                send_discovery_select(mqtt_client, "system_mode", "Режим системы",
-                                      "hydro/switch/mode/set", "hydro/switch/mode/state");
+                // === Переключатель режима (AUTO/MANUAL) — toggle: ON=auto, OFF=manual ===
+                send_discovery_switch_custom(mqtt_client, "system_mode", "Режим работы (manual/auto)",
+                                      "hydro/switch/mode/set", "hydro/switch/mode/state",
+                                      "auto", "manual");
 
                 // === Диагностика ===
                 send_discovery_firmware_version(mqtt_client);
@@ -572,6 +580,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // Регистрируем callback для автоматической публикации состояния GPIO
             device_control_register_state_cb(on_device_state_changed);
 
+            // Регистрируем callback для публикации изменения режима
+            device_control_register_mode_cb(on_mode_changed);
+
             // Публикуем текущее состояние выключателей (callback не вызовется т.к. GPIO не меняется)
             publish_switch_state("hydro/switch/pump/state", device_control_get_pump_state());
             publish_switch_state("hydro/switch/light/state", device_control_get_light_state());
@@ -613,12 +624,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // СОБЫТИЕ: ОТКЛЮЧЕНИЕ ОТ БРОКЕРА
         // ================================================================
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "MQTT отключён. Автоматическое переподключение...");
             atomic_store(&mqtt_connected, false);
-            // Сбрасываем флаг discovery — при следующем подключении HA может не иметь конфигурации
-            atomic_store(&s_discovery_sent, false);
-            // Сбрасываем флаг публикации времени — при повторной синхронизации NTP нужно опубликовать
-            s_time_published = false;
+            // Если пользователь отключил MQTT — не переподключаемся автоматически
+            if (!atomic_load(&s_mqtt_enabled)) {
+                ESP_LOGI(TAG, "MQTT отключён пользователем — переподключение отменено");
+            } else {
+                ESP_LOGW(TAG, "MQTT отключён. Автоматическое переподключение...");
+                // Сбрасываем флаг discovery — при следующем подключении HA может не иметь конфигурации
+                atomic_store(&s_discovery_sent, false);
+                // Сбрасываем флаг публикации времени — при повторной синхронизации NTP нужно опубликовать
+                s_time_published = false;
+            }
             break;
 
         // ================================================================
@@ -1083,4 +1099,25 @@ esp_err_t mqtt_client_publish_touch_state(bool state)
 void *mqtt_client_get_handle(void)
 {
     return mqtt_client;
+}
+
+void mqtt_client_set_enabled(bool enabled)
+{
+    bool was_enabled = atomic_exchange(&s_mqtt_enabled, enabled);
+    if (was_enabled && !enabled) {
+        // Отключение — разрываем соединение
+        ESP_LOGI(TAG, "MQTT отключён пользователем");
+        if (mqtt_client) {
+            esp_mqtt_client_stop(mqtt_client);
+        }
+    } else if (!was_enabled && enabled) {
+        // Включение — переподключаемся
+        ESP_LOGI(TAG, "MQTT включён пользователем");
+        mqtt_client_restart();
+    }
+}
+
+bool mqtt_client_is_enabled(void)
+{
+    return atomic_load(&s_mqtt_enabled);
 }

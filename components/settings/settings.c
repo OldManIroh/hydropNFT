@@ -105,6 +105,9 @@ esp_err_t settings_set_wifi_ssid(const char *ssid)
 {
     esp_err_t err = nvs_set_str_safe("wifi_ssid", ssid);
     if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "WiFi SSID сохранён в NVS");
     }
     return err;
@@ -118,6 +121,9 @@ esp_err_t settings_get_wifi_pass(char *buf, size_t buf_size)
 esp_err_t settings_set_wifi_pass(const char *pass)
 {
     esp_err_t err = nvs_set_str_safe("wifi_pass", pass);
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "WiFi пароль сохранён в NVS");
     }
@@ -137,6 +143,9 @@ esp_err_t settings_set_mqtt_uri(const char *uri)
 {
     esp_err_t err = nvs_set_str_safe("mqtt_uri", uri);
     if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "MQTT URI сохранён в NVS");
     }
     return err;
@@ -151,6 +160,9 @@ esp_err_t settings_set_mqtt_user(const char *user)
 {
     esp_err_t err = nvs_set_str_safe("mqtt_user", user);
     if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "MQTT user сохранён в NVS");
     }
     return err;
@@ -164,6 +176,9 @@ esp_err_t settings_get_mqtt_pass(char *buf, size_t buf_size)
 esp_err_t settings_set_mqtt_pass(const char *pass)
 {
     esp_err_t err = nvs_set_str_safe("mqtt_pass", pass);
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "MQTT пароль сохранён в NVS");
     }

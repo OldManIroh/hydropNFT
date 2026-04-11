@@ -221,7 +221,7 @@ void dht_task(void *pvParameters)
 
         if (res == ESP_OK) {
             device_control_set_dht_data(temperature, humidity, true);
-            ESP_LOGI(TAG, "DHT: Влажность=%.1f%% Температура=%.1f°C", humidity, temperature);
+            ESP_LOGD(TAG, "DHT: Влажность=%.1f%% Температура=%.1f°C", humidity, temperature);
         } else {
             // Сбрасываем valid чтобы не публиковать устаревшие данные
             device_control_set_dht_data(0.0f, 0.0f, false);
@@ -282,7 +282,7 @@ void ads1115_task(void *pvParameters)
         if (res == ESP_OK) {
             for (int i = 0; i < ADS1115_NUM_CHANNELS; i++) {
                 if (measurements[i].error == ESP_OK) {
-                    ESP_LOGI(TAG, "Канал %u: напряжение = %.04f В",
+                    ESP_LOGD(TAG, "Канал %u: напряжение = %.04f В",
                            measurements[i].channel,
                            measurements[i].voltage);
                 } else {
@@ -314,15 +314,11 @@ void ads1115_task(void *pvParameters)
  */
 void mqtt_sensor_task(void *pvParameters)
 {
-    // Добавляем задачу в TWDT — если задача зависнет, watchdog перезагрузит устройство
-    // Без этого зависшая задача публикации сенсоров не будет обнаружена
-    esp_task_wdt_add(NULL);
     while (1) {
-        esp_task_wdt_reset();  // Сброс watchdog — задача жива
         if (mqtt_client_is_connected()) {
             mqtt_client_publish_sensor_data();
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
@@ -395,13 +391,10 @@ void light_schedule_task(void *pvParameters)
     EventGroupHandle_t event = (EventGroupHandle_t)pvParameters;
     int night_end = (LIGHT_ON_HOUR > 0) ? LIGHT_ON_HOUR - 1 : 23;
 
-    // TWDT — задача управляет светом по расписанию, зависание = свет не переключится
-    esp_task_wdt_add(NULL);
     ESP_LOGI(TAG, "Задача управления светом запущена (день=%d:00–23:59, ночь=00:00–%02d:59)",
              LIGHT_ON_HOUR, night_end);
 
     while (1) {
-        esp_task_wdt_reset();  // Сброс watchdog
         if (!sntp_client_is_synced()) {
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
@@ -482,9 +475,6 @@ void pump_valve_schedule_task(void *pvParameters)
 {
     EventGroupHandle_t event = (EventGroupHandle_t)pvParameters;
 
-    // TWDT — задача управляет насосом/клапаном, зависание = затопление или пересыхание
-    esp_task_wdt_add(NULL);
-
     typedef enum {
         STATE_CIRCULATING,   ///< День: насос ВКЛ, клапан ЗАКРЫТ, ждём ESP-NOW true
         STATE_DRAINING,      ///< День: насос ВЫКЛ, клапан ОТКРЫТ, таймер 5 мин
@@ -507,7 +497,6 @@ void pump_valve_schedule_task(void *pvParameters)
     ESP_LOGI(TAG, "Задача управления насосом/клапаном запущена");
 
     while (1) {
-        esp_task_wdt_reset();
         if (!sntp_client_is_synced()) {
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
@@ -1111,6 +1100,13 @@ void app_main(void)
         ESP_LOGE(TAG, "Ошибка esp_wifi_start: %s — продолжаю в fallback", esp_err_to_name(err));
     } else {
         ESP_LOGI(TAG, "WiFi APSTA запущен: AP='%s' (WPA2)", ap_ssid);
+    }
+
+    // Явный вызов esp_wifi_connect() — ESP-IDF НЕ подключает STA автоматически после esp_wifi_start().
+    // Без этого подключения не произойдёт, только после wifi_reconnect_task (через 67+ сек).
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "esp_wifi_connect: %s (возможно STA не настроен)", esp_err_to_name(err));
     }
 
     // Обработчик отключения STA — автоматическое переподключение

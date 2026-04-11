@@ -51,14 +51,20 @@ menu "Настройки SNTP (времени)"
 
     config SNTP_TIMEZONE
         string "Часовой пояс (POSIX TZ string)"
-        default "MSK-5"
+        default "UTC-5"
         help
             Строка часового пояса в формате POSIX TZ.
+
+            ВАЖНО: используйте UTC, а не MSK/MSK — newlib не понимает
+            аббревиатуры вроде MSK, CET, EST и т.д.
+
+            Формат: UTC-N означает UTC+N (минус = впереди UTC)
+
             Примеры:
-              MSK-5    — UTC+5 (Екатеринбург)
-              MSK-3    — UTC+3 (Москва)
-              UTC0     — UTC
-              CST-8    — UTC+8 (Китай)
+              UTC-5    — UTC+5 (Екатеринбург)
+              UTC-3    — UTC+3 (Москва)
+              UTC0     — UTC (Лондон, Гринвич)
+              UTC-8    — UTC+8 (Пекин, Шанхай)
               EST5EDT  — Восточное время США с DST
 
 endmenu

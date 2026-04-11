@@ -70,6 +70,9 @@ static _Atomic bool s_ads1115_stop_requested = false;
 ///   при портировании на другие архитектуры.
 static _Atomic device_state_change_cb_t s_state_cb = NULL;
 
+/// Callback для уведомления об изменении режима (устанавливается из mqtt_client)
+static _Atomic device_mode_change_cb_t s_mode_cb = NULL;
+
 // ============================================================================
 // ИНИЦИАЛИЗАЦИЯ
 // ============================================================================
@@ -215,8 +218,21 @@ bool device_control_get_valve_state(void)
 
 void device_control_set_mode(device_mode_t mode)
 {
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "device_control не инициализирован — команда режима проигнорирована");
+        return;
+    }
     atomic_store(&s_mode, mode);
     ESP_LOGI(TAG, "Режим системы: %s", device_control_mode_to_string(mode));
+
+    // Уведомляем задачи расписаний через EventGroup
+    device_control_notify_mode_changed();
+
+    // Публикуем новый режим в MQTT (через callback с корректной строкой)
+    device_mode_change_cb_t cb = atomic_load(&s_mode_cb);
+    if (cb) {
+        cb(device_control_mode_to_string(mode));
+    }
 }
 
 device_mode_t device_control_get_mode(void)
@@ -258,6 +274,11 @@ device_mode_t device_control_mode_from_string(const char *str)
 void device_control_register_state_cb(device_state_change_cb_t cb)
 {
     atomic_store(&s_state_cb, cb);
+}
+
+void device_control_register_mode_cb(device_mode_change_cb_t cb)
+{
+    atomic_store(&s_mode_cb, cb);
 }
 
 // ============================================================================

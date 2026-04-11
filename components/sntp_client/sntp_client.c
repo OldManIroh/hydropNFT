@@ -51,35 +51,29 @@ static _Atomic bool s_time_synced = false;
  */
 void time_sync_notification_cb(struct timeval *tv)
 {
-    // Получаем текущее время для форматирования
+    // Устанавливаем часовой пояс UTC+5 (Екатеринбург)
+    // POSIX: UTC-5 означает "впереди UTC на 5 часов" (минус = east)
+#ifdef CONFIG_SNTP_TIMEZONE
+    setenv("TZ", CONFIG_SNTP_TIMEZONE, 1);
+#else
+    setenv("TZ", "UTC-5", 1);
+#endif
+    tzset();
+
+    // Форматируем время — уже с учётом часового пояса
     time_t now;
     struct tm timeinfo;
     time(&now);
     localtime_r(&now, &timeinfo);
 
-    // Форматируем время в строку для красивого вывода
     char strftime_buf[64];
     strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
     // ESP_LOGI — только в UART терминал
     ESP_LOGI(TAG, "SNTP синхронизировано: %s", strftime_buf);
 
-    // Устанавливаем часовой пояс UTC+5 (Екатеринбург)
-#ifdef CONFIG_SNTP_TIMEZONE
-    setenv("TZ", CONFIG_SNTP_TIMEZONE, 1);
-#else
-    setenv("TZ", "MSK-5", 1);
-#endif
-    tzset();
-
     // Устанавливаем флаг синхронизации
     atomic_store(&s_time_synced, true);
-
-    // Публикуем время в MQTT через log_forwarder (ESP_LOGW → WARNING → MQTT)
-    // Если MQTT подключён — log_forwarder перешлёт; если нет — пропустит
-    if (mqtt_client_is_connected()) {
-        ESP_LOGW(TAG, "Локальное время (NTP синхронизировано): %s", strftime_buf);
-    }
 }
 
 /**

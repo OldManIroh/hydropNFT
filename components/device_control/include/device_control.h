@@ -147,6 +147,23 @@ typedef void (*device_state_change_cb_t)(const char *topic, bool state);
  */
 void device_control_register_state_cb(device_state_change_cb_t cb);
 
+/**
+ * @brief Callback для уведомления об изменении режима работы
+ * @param mode_str Строка режима ("auto" или "manual")
+ *
+ * @note Вызывается после device_control_set_mode() в контексте вызывающей задачи
+ */
+typedef void (*device_mode_change_cb_t)(const char *mode_str);
+
+/**
+ * @brief Зарегистрировать callback для уведомления об изменении режима
+ * @param cb Callback-функция или NULL для отмены
+ *
+ * @note Вызывается из mqtt_client при подключении к MQTT
+ * @note Только один callback может быть зарегистрирован одновременно
+ */
+void device_control_register_mode_cb(device_mode_change_cb_t cb);
+
 // ============================================================================
 // ДАННЫЕ DHT
 // ============================================================================
