@@ -20,8 +20,8 @@ menu "Настройки оборудования"
 
     config VALVE_DRAIN_DURATION_MIN
         int "Время слива воды (минуты)"
-        default 5
-        range 1 30
+        default 10
+        range 1 60
         help
             Длительность слива воды через клапан в минутах.
             Используется в автоматическом режиме DRAINING.
