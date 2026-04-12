@@ -454,7 +454,7 @@ void light_schedule_task(void *pvParameters)
  *
  * ДЕНЬ (8:00–23:59):
  *   CIRCULATING → DRAINING   : ESP-NOW false→true (верхний уровень)
- *   DRAINING → CIRCULATING   : таймер слива ≥ 5 мин
+ *   DRAINING → CIRCULATING   : таймер слива ≥ 10 мин
  *   CIRCULATING → NIGHT_STOP : наступила ночь, насос работает
  *
  * НОЧЬ (00:00–07:59):
